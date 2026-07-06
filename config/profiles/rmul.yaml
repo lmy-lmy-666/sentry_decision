@@ -1,0 +1,43 @@
+# RMUL tactic profile — conservative single-point patrol.
+
+name: rmul
+
+thresholds:
+  hp_low: 200
+  hp_critical: 80
+  heat_max: 240
+  ammo_min: 0
+  game_total_time: 420
+  min_ticks_in_state: 4
+  hp_low_exit_hysteresis: 240
+  hp_critical_exit: 160
+  stuck_timeout_s: 30.0
+  resupply_timeout_s: 60.0
+  retreat_timeout_s: 90.0
+  enemy_lost_time_s: 5.0
+  engage_distance: 3.0
+  track_distance: 8.0
+  enhanced_defense_duration_s: 15.0
+
+patrol:
+  - {x: 4.6, y: -3.3, dwell_s: 8.0}
+
+attack_push: []
+enable_attack_push: false
+
+defend_fallback: []
+supply: {x: 0.0, y: -0.5}
+retreat: {x: 0.0, y: -0.5}
+safe_cover: {x: 0.0, y: -0.5}
+backup_supply_points: []
+backup_retreat_points: []
+
+late_game_leading:
+  disable_attack_push: true
+  fallback_patrol:
+    - {x: 1.0, y: -1.0, dwell_s: 8.0}
+
+late_game_trailing:
+  disable_attack_push: true
+  fallback_patrol:
+    - {x: 3.0, y: -2.0, dwell_s: 8.0}

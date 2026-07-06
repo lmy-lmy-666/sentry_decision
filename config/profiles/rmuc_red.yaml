@@ -1,0 +1,50 @@
+# RMUC tactic profile — RED side.
+# Balanced default: defend/patrol normally, push only while healthy and early.
+
+name: rmuc_red
+
+thresholds:
+  hp_low: 150
+  hp_critical: 60
+  heat_max: 240
+  ammo_min: 1
+  game_total_time: 420
+  min_ticks_in_state: 4
+  hp_low_exit_hysteresis: 180
+  hp_critical_exit: 120
+  stuck_timeout_s: 30.0
+  resupply_timeout_s: 60.0
+  retreat_timeout_s: 90.0
+  enemy_lost_time_s: 5.0
+  engage_distance: 3.0
+  track_distance: 8.0
+  enhanced_defense_duration_s: 15.0
+
+patrol:
+  - {x: 3.88, y: 2.67, dwell_s: 10.0}
+  - {x: 4.24, y: -2.54, dwell_s: 15.0}
+  - {x: 3.85, y: 2.58, dwell_s: 10.0}
+
+attack_push:
+  - {x: 12.08, y: 0.09, dwell_s: 15.0}
+enable_attack_push: true
+
+defend_fallback:
+  - {x: 2.0, y: 0.0, dwell_s: 10.0}
+
+supply: {x: -1.02, y: -4.91}
+retreat: {x: -1.02, y: -4.97}
+safe_cover: {x: 2.0, y: 0.0}
+
+backup_supply_points: []
+backup_retreat_points: []
+
+late_game_leading:
+  disable_attack_push: true
+  fallback_patrol:
+    - {x: 2.0, y: 1.5, dwell_s: 10.0}
+    - {x: 2.0, y: -1.5, dwell_s: 10.0}
+
+late_game_trailing:
+  disable_attack_push: false
+  fallback_patrol: []
