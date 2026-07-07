@@ -165,11 +165,15 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 ## 十、编译与测试
 
 ```bash
+cd ~/Sentry26
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select rm_interfaces radar_msgs sentry_decision
+source install/setup.bash
 
-# 测试
-export LD_LIBRARY_PATH=~/Sentry26/install/lib:~/Sentry26/install/rm_interfaces/lib:~/Sentry26/install/radar_msgs/lib:$LD_LIBRARY_PATH
+# 编译
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release --packages-select sentry_decision
+
+# 单元测试
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON --packages-select sentry_decision
 ~/Sentry26/build/sentry_decision/fsm_test
 ```
 
@@ -181,8 +185,9 @@ GTest: 30/30
 ## 十一、运行
 
 ```bash
+cd ~/Sentry26
 source /opt/ros/jazzy/setup.bash
-source ~/Sentry26/install/setup.bash
+source install/setup.bash
 
 # 红方
 ros2 run sentry_decision sentry_decision_node --ros-args \

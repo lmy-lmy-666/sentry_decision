@@ -213,6 +213,17 @@ Nav2 不可用时 `cancel_nav()` 也正确清理 `nav_goals_active_` 和 `fallba
 #### 8.7 导航卡住时 goal 清理
 `combat_track` 和 `combat_evade_air` 在 `nav_stuck` 时先设 `goal_sent_=false`，确保新目标能正常发出。
 
+#### 8.8 构建环境修复
+- Sentry26 workspace 添加 `.colcon/defaults.yaml`（base-paths: src）
+- `rmoss_gz_plugins` 旧版 libgz-math 缓存清理
+- `radar_msgs` 符号链接冲突清理
+- `.gitignore` 添加 build/install/log，防止子目录构建产物污染 git
+- 全仓 30 包编译通过，决策 30/30 测试通过
+
+#### 8.9 数据流验证
+- 裁判数据流：外部学校 bag → 决策 PATROL→RESUPPLY→RETREAT→IDLE（验证通过）
+- 雷达数据流：雷达测试 bag → EnemyInfo 正常填充（验证通过）
+
 ### 2026-07-05 历史修改
 
 - 基础稳定性修复（now()、RFID、空 route、hysteresis、姿态冷却去重）
@@ -284,15 +295,17 @@ Nav2 不可用时 `cancel_nav()` 也正确清理 `nav_goals_active_` 和 `fallba
 ## 11. 编译与运行
 
 ```bash
+cd ~/Sentry26
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select rm_interfaces radar_msgs sentry_decision
+source install/setup.bash
 
-# 测试
-source ~/Sentry26/install/setup.bash
-ctest --test-dir ~/Sentry26/build/sentry_decision
-```
+# 编译
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release --packages-select sentry_decision
 
-```bash
+# 单元测试（需要先 cmake -DBUILD_TESTING=ON 编译）
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON --packages-select sentry_decision
+~/Sentry26/build/sentry_decision/fsm_test
+
 # 红方
 ros2 run sentry_decision sentry_decision_node --ros-args \
   -p profile_path:=~/Sentry26/src/sentry_decision/config/profiles/rmuc_red.yaml
