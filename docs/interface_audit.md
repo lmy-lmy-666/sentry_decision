@@ -1,6 +1,6 @@
 # sentry_decision 接口审计
 
-> 日期: 2026-07-05  
+> 日期: 2026-07-07  
 > 目标: 评估 `/home/lmy/Sentry26/src/sentry_decision` 要达到比赛可用还缺哪些输入/输出闭环。  
 > 审计范围: `/home/lmy/Sentry26/src` 下的决策、串口、接口、motion manager、导航 bringup 相关文件。
 
@@ -8,30 +8,30 @@
 
 ## 1. 总体结论
 
-当前 `sentry_decision` 的 FSM 骨架和测试基础已经比较完整，顶层 6 状态可以保留：
+当前 `sentry_decision` 的 FSM 骨架和测试基础已经完整，顶层 6 状态：
 
 - `IDLE`
 - `PATROL`
-- `DEFEND`
+- `DEFEND`（含 6 个战斗子状态）
 - `ATTACK_PUSH`
 - `RESUPPLY`
 - `RETREAT`
 
-但要上比赛场，还缺几个关键闭环：
+代码端已闭环，剩余依赖外部：
 
-1. **EnemyInfo 已有自瞄兼容输入**：决策端已订阅 `auto_aim_target_pos` (`std_msgs/String`, `x,y,valid,id`) 并转换为 `EnemyInfo`；可触发 `DEFEND/TRACK/ENGAGE`，但仍不是结构化消息，也不是全局敌方态势。
+1. **EnemyInfo 已有自瞄+雷达双源输入**：自瞄做近距离检测，雷达提供全局坐标用于追击。已通过 bag 回放验证数据流。
 2. **SentryInfo 没有真实来源**：没有 0x020D/姿态/脱战/强化剩余时间接口。
-3. **0x0120 下行不存在**：`send_stance_command()` 仍是 STUB，串口 driver 目前只发送导航速度 `0xB5`。
-4. **串口协议非常精简**：当前自定义串口包只覆盖 game/hp/rfid_base/nav，不覆盖 RM2026 通信协议里大量哨兵决策关键字段。
-5. **motion_state 是 String**：可用但不稳，长期建议结构化消息。
-6. **fallback goal 没有独立到达检测**：Nav2 action 不可用时，仅 publish `/goal_pose`，需要依赖 motion_manager 间接反馈，否则 route 可能卡住。
+3. **0x0120 下行已打通（ROS 端）**：`sentry/command` → `serial_driver` → `0xB6`。STM32 解析待配合。
+4. **motion_state 双通道**：结构化 + String fallback，已加固解析。
+5. **fallback goal 已有 odom 到达检测**：Nav2 不可用时自动切换。
+6. **RESUPPLY 冷却 + EVADE 反击 + TRACK 追击 + cancel_nav 清理**：全部已实现。
 
 优先级建议：
 
 ```text
-P0: 0x0120 下行 + 自瞄输入联调验证
-P1: SentryInfo/0x020D + motion_state 结构化/兜底 + retreat/resupply 失败恢复
-P2: 雷达/全局敌方态势、late_game 领先/落后、defend_fallback、backup_retreat、规则禁区检查
+P0: STM32 解析 0xB6
+P1: SentryInfo/0x020D 接入
+P2: 自瞄结构化 Target、Profile 坐标确认、仿真闭环验证
 ```
 
 ---
@@ -492,41 +492,37 @@ bool activate_energy_mechanism
 - result succeeded → `ARRIVED`
 - rejected/aborted/unknown → `FAILED`
 
-这是可用的。
+**已解决**：
 
-风险在 fallback：
-
-```cpp
-if (!nav_action_client_->action_server_is_ready()) {
-  publish_goal_topic_fallback(wp);
-}
-```
-
-fallback 只 publish `PoseStamped`，没有 action feedback。当前能否到达依赖 motion_manager/string 或其他外部机制。
-
-建议：
-
-1. 上场优先要求 Nav2 action 正常，不依赖 fallback。
-2. fallback 模式如要保留，需订阅 odom/current_pose 并做距离判断。
-3. `cancel_nav()` 在 action server 不可用时也应清理本节点内部状态，避免 `nav_goals_active_` 卡住。
+- fallback 模式已加入 odom 距离检测（`on_tick` 中 `hypot(dx, dy) <= 0.25m` → `ARRIVED`）。
+- `cancel_nav()` 在 action server 不可用时也清理 `nav_goals_active_` 和 `fallback_goal_active_`。
 
 ---
 
 ## 9. 上场前必须闭环清单
 
 ### 已完成
-- [x] 真实填充 `EnemyInfo`，兼容自瞄 `auto_aim_target_pos` (`std_msgs/String`, `x,y,valid,id`)。
-- [x] 新增 `SentryCommand.msg` 并打通 `sentry/command` → `serial_driver` → `0xB6` 下行。
-- [x] `ATTACK_PUSH` 被攻击时立即退出（增加 `!under_attack()` 条件）。
-- [x] `RESUPPLY` 补给全部超时后退出兜底（不再卡死）。
-- [x] `RETREAT` stuck/timeout 依次尝试 `backup_retreat_points` → `safe_cover`。
-- [x] `DEFEND/SCOUT` 使用 `defend_fallback` 防守巡逻。
-- [x] `late_game` 使用 profile `late_game_leading` 配置。
-- [x] `Combat SubState` 超时保护（TRACK 20s / ENGAGE 30s）。
-- [x] `motion_state` 解析加固（词边界检查 + 连续 idle 确认）。
-- [x] 裁判 stale timeout 参数化（`referee_stale_timeout_s`，默认 3.0s）。
-- [x] `motion_manager` 新增结构化 `MotionState.msg` topic，`sentry_decision` 同时订阅 String 和结构化（优先结构化）。
-- [x] 雷达站 ROS2 桥接：`radar/enemy_positions` (EnemyPosition) 发布敌方全局坐标，`sentry_decision` 订阅并聚合为 EnemyInfo。已实机验证链路通。
+- [x] EnemyInfo 自瞄+雷达双源输入，自瞄管检测、雷达管坐标
+- [x] `SentryCommand.msg` + `sentry/command` → `serial_driver` → `0xB6` 下行
+- [x] RESUPPLY 防死循环振荡（15s 冷却 + 到达重置 + 弹药空绕过）
+- [x] EVADE 切进攻姿态反击
+- [x] TRACK 雷达坐标驱动追击（EnemyInfo 新增 nearest_x/y，Context 新增 sentry_x/y）
+- [x] ATTACK_PUSH 被攻击时退出
+- [x] RESUPPLY 补给全部超时后退出兜底
+- [x] RETREAT stuck/timeout 依次尝试 backup_retreat_points → safe_cover
+- [x] DEFEND/SCOUT 使用 defend_fallback 防守巡逻
+- [x] late_game 使用 profile late_game_leading 配置
+- [x] Combat SubState 超时保护（TRACK 10s / ENGAGE 30s）
+- [x] motion_state 解析加固（词边界 + 连续 idle 确认）
+- [x] 裁判 stale timeout 参数化（referee_stale_timeout_s，默认 3.0s）
+- [x] motion_manager 结构化 MotionState topic
+- [x] 雷达站 ROS2 桥接：radar/enemy_positions
+- [x] EnemyInfo 过期可配（enemy_stale_timeout_s，默认 1.0s）
+- [x] cancel_nav fallback 标志位清理
+- [x] Nav2 fallback odom 到达检测
+- [x] 裁判数据流验证（bag 回放）
+- [x] 雷达数据流验证（bag 回放）
+- [x] 单元测试 30/30 通过
 
 ### 必须完成
 - [ ] STM32 侧解析 `0xB6` 并转换为 RM2026 `0x0120 sentry_cmd` 发送（电控配合）。
