@@ -197,6 +197,10 @@ void DecisionNode::cancel_nav()
   if (!nav_action_client_->action_server_is_ready()) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 2000, "Nav2 action server not available, cannot cancel goals");
+    // fallback 模式下仍需清理标志位，防止 on_tick 用旧坐标做到达检测
+    nav_goals_active_ = false;
+    fallback_goal_active_ = false;
+    context_.set_nav_status(NavStatus::IDLE);
     return;
   }
   if (current_goal_handle_) {
@@ -346,6 +350,9 @@ void DecisionNode::auto_aim_target_callback(const std_msgs::msg::String::SharedP
       "invalid auto aim target payload '%s', expected x,y,valid,id", msg->data.c_str());
     return;
   }
+  // 保留雷达提供的全局坐标（自瞄只管检测和距离，不提供 map 坐标系位置）
+  enemy.nearest_x = context_.nearest_enemy_x();
+  enemy.nearest_y = context_.nearest_enemy_y();
   context_.update(enemy);
 }
 
@@ -401,17 +408,24 @@ void DecisionNode::radar_callback(const radar_msgs::msg::EnemyPosition::SharedPt
   // Aggregate all valid radar positions into EnemyInfo
   EnemyInfo enemy;
   double min_dist = 999.0;
+  double nearest_x = 0.0, nearest_y = 0.0;
   int count = 0;
   for (const auto & s : radar_positions_) {
     if (!s.valid) continue;
     double dist = std::hypot(s.x, s.y);
-    if (dist < min_dist) min_dist = dist;
+    if (dist < min_dist) {
+      min_dist = dist;
+      nearest_x = s.x;
+      nearest_y = s.y;
+    }
     count++;
   }
   if (radar_positions_[4].valid) enemy.aerial_threat = true;  // TYPE_AERIAL
   enemy.detected = count > 0;
   enemy.count = count;
   enemy.nearest_distance = min_dist;
+  enemy.nearest_x = nearest_x;
+  enemy.nearest_y = nearest_y;
   context_.update(enemy);
 }
 
@@ -434,6 +448,7 @@ void DecisionNode::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr ms
 {
   current_x_ = msg->pose.pose.position.x;
   current_y_ = msg->pose.pose.position.y;
+  context_.set_sentry_position(current_x_, current_y_);
 }
 
 }  // namespace sentry_decision

@@ -142,7 +142,7 @@ public:
     }
   }
 
-  bool enemy_info_fresh() const { return enemy_info_ && (now() - enemy_info_stamp_) < 0.5; }
+  bool enemy_info_fresh() const { return enemy_info_ && (now() - enemy_info_stamp_) < thresholds_.enemy_stale_timeout_s; }
 
   bool under_aerial_attack() const { return enemy_info_fresh() && enemy_info_->aerial_threat; }
 
@@ -152,6 +152,10 @@ public:
   {
     return enemy_info_fresh() ? enemy_info_->nearest_distance : 999.0;
   }
+
+  double nearest_enemy_x() const { return enemy_info_fresh() ? enemy_info_->nearest_x : 0.0; }
+
+  double nearest_enemy_y() const { return enemy_info_fresh() ? enemy_info_->nearest_y : 0.0; }
 
   int enemy_count() const { return enemy_info_fresh() ? enemy_info_->count : 0; }
 
@@ -172,6 +176,14 @@ public:
 
   void set_nav_status(NavStatus s) { nav_status_ = s; }
   NavStatus nav_status() const { return nav_status_; }
+
+  void set_sentry_position(double x, double y)
+  {
+    sentry_x_ = x;
+    sentry_y_ = y;
+  }
+  double sentry_x() const { return sentry_x_; }
+  double sentry_y() const { return sentry_y_; }
   bool nav_stuck() const
   {
     return nav_status_ == NavStatus::STUCK || nav_status_ == NavStatus::FAILED;
@@ -197,6 +209,8 @@ private:
   double game_status_stamp_{0.0};
   double robot_status_stamp_{0.0};
   NavStatus nav_status_{NavStatus::IDLE};
+  double sentry_x_{0.0};
+  double sentry_y_{0.0};
   Thresholds thresholds_;
 };
 

@@ -87,6 +87,10 @@ Profile load_profile(const std::string & yaml_path)
   p.thresholds.track_distance = get_or<double>(th, "track_distance", def.track_distance);
   p.thresholds.enhanced_defense_duration_s =
     get_or<double>(th, "enhanced_defense_duration_s", def.enhanced_defense_duration_s);
+  p.thresholds.enemy_stale_timeout_s =
+    get_or<double>(th, "enemy_stale_timeout_s", def.enemy_stale_timeout_s);
+  p.thresholds.supply_retry_cooldown_s =
+    get_or<double>(th, "supply_retry_cooldown_s", def.supply_retry_cooldown_s);
 
   p.patrol = parse_route(root["patrol"]);
   p.attack_push = parse_route(root["attack_push"]);

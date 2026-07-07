@@ -1,6 +1,6 @@
-# sentry_decision — 决策系统当前能力说明
+# sentry_decision — 决策系统能力说明
 
-> 最后更新: 2026-07-06 | 目标机器人: 哨兵 (Sentry) | 赛季: RM2026
+> 最后更新: 2026-07-07 | 目标机器人: 哨兵 (Sentry) | 赛季: RM2026
 
 ---
 
@@ -8,211 +8,266 @@
 
 `sentry_decision` 是哨兵自主导航决策层，基于纯 C++17 有限状态机（FSM），通过 YAML 配置文件切换战术，无需重新编译。
 
-## 2. 当前输入
+## 2. 输入源
 
 | 数据源 | 来源 | 用途 |
 |--------|------|------|
 | 裁判系统 | `rm_serial_driver` → `/referee/*` | 比赛状态、血量、弹药、热量、RFID、金币 |
 | 自瞄 | `auto_aim_target_pos`（String 解析） | 近距离敌方检测 → DEFEND/TRACK/ENGAGE |
-| 雷达 | `RM2026_BOF_Radar` → `/radar/enemy_positions` | 全局敌方坐标 → 完整敌方感知 |
-| 运动状态 | `motion_manager/motion_state`（结构化） + `motion_manager/state`（String fallback） | 导航状态（移动中/卡住/到达/失败） |
-| 里程计 | `/odometry` | fallback 模式到达检测 |
+| 雷达 | `RM2026_BOF_Radar` → `/radar/enemy_positions` | 全局敌方坐标 → 完整敌方感知 + 追击导航 |
+| 运动状态 | `motion_manager/motion_state`（结构化优先） + `motion_manager/state`（String fallback） | 导航状态（移动中/卡住/到达/失败） |
+| 里程计 | `/odometry` | 己方位置（追击用）+ fallback 模式到达检测 |
 
-## 3. 当前输出
+## 3. 输出
 
 | 输出 | 目标 | 说明 |
 |------|------|------|
 | Nav2 goal | `navigate_to_pose` action | 导航路点 |
-| `/goal_pose` | PoseStamped topic | fallback 模式 |
+| `/goal_pose` | PoseStamped topic | Nav2 宕机时的 fallback |
 | 姿态指令 | `sentry/command` → `serial_driver` → `0xB6` → STM32 | 进攻/防御/移动/强化姿态 |
-| 远程兑换 | `sentry/command`（字段预留） | 弹药/血量兑换请求 |
-
-## 4. 顶层状态
-
-| 状态 | 触发条件 | 行为 |
-|------|---------|------|
-| IDLE | 比赛未运行/裁判数据失效 | 停止导航 |
-| PATROL | 默认，无更高优先级任务 | patrol 路线巡逻（后期切换 fallback_patrol） |
-| DEFEND | 敌方检测/被攻击/空中威胁 | SCOUT→TRACK→ENGAGE→EVADE，空中→HARDEN→EVADE_AIR |
-| ATTACK_PUSH | 前哨站存活+血量弹药充足+不过热+不被攻击+后期不前压 | attack_push 路线前压 |
-| RESUPPLY | 弹药空/血量低，且无敌人在附近 | 去补给区，失败后回 PATROL |
-| RETREAT | 血量危急(hp<60) | 去安全点，卡住换备用点，血量恢复后退出 |
-
-## 5. 子状态
-
-| 子状态 | 说明 | 超时 |
-|--------|------|------|
-| SCOUT | 搜索：防守巡逻（defend_fallback），发现敌人→TRACK | — |
-| TRACK | 追踪：距离>3m跟踪，<3m→ENGAGE，被击中→EVADE | 20s |
-| ENGAGE | 交战：停住射击，敌人消失→SCOUT，被击中→EVADE | 30s |
-| EVADE | 闪避：向 safe_cover 移动，2s安全→SCOUT | — |
-| HARDEN | 强化防御：抵抗空中威胁，15s后→EVADE_AIR | 15s |
-| EVADE_AIR | 防空闪避：不规则移动，空中威胁消失→SCOUT | — |
-
-## 6. 稳定性保护
-
-- **state hysteresis**：RETREAT 进入 hp<60，退出 hp>120；RESUPPLY 进入 hp<150，退出 hp>180
-- **min_ticks_in_state**：普通状态最小停留 4 tick（防振荡）
-- **stance 冷却**：5s，DEFENSIVE/ENHANCED_DEFENSIVE 可绕过
-- **EnemyInfo 过期**：0.5s 无新数据自动清除
-- **motion_state 加固**：词边界检查 + 连续 3 次 idle 才判失败
-- **敌人在时不进 RESUPPLY**：避免战斗和补给来回切
-- **Nav2 fallback**：action down 时用 odom 自行判断到达
-
-## 7. 测试状态
-
-```text
-GTest: 19/19 通过
-Lint: 7/7 通过
-编译: rm_interfaces + radar_msgs + sentry_decision + rm_serial_driver + sentry_motion_manager 通过
-实机: 雷达 ROS 桥接数据流经验证
-```
+| 远程兑换/复活 | `sentry/command`（字段预留） | 待 FSM 驱动 |
 
 ---
 
-## 2. 代码架构
+## 4. 顶层状态机
+
+### 4.1 优先级链（每 tick 重评估，只命中第一个满足的）
+
+```
+优先级从高到低：
+
+① IDLE          ← 裁判数据失效 / 比赛未运行
+② RETREAT       ← hp < 60（已在 RETREAT 则 hp < 120 才退出，hysteresis 防振荡）
+③ DEFEND(空中)  ← 空中威胁
+④ RESUPPLY 保持 ← 已在补给中，仍需补给。弹药空时不退出。
+                  ├─ 补给耗尽 & hp ≥ 120 → 退出
+                  └─ 未耗尽 & (弹药空 or hp < 400) → 保持
+⑤ RESUPPLY 进入 ← 需要补给 & 不在冷却期。
+                  冷却期：补给耗尽后有弹药时 15s 不重试（弹药空时绕过冷却）
+⑥ DEFEND(地面)  ← 敌人检测 / 被攻击
+⑦ ATTACK_PUSH   ← 前哨存活 + hp≥180 + 弹药充足 + 不过热 + 不被攻击 + 非后期
+⑧ PATROL        ← 默认
+```
+
+### 4.2 状态切换防振荡 (can_leave_current_state)
+
+- IDLE 可以随时离开
+- 进入 IDLE / RETREAT / DEFEND 总是允许（安全优先）
+- RESUPPLY 可以抢断除 RETREAT 外的任何状态
+- 其他状态间切换需要 `min_ticks_in_state`（默认 4 ticks = 400ms）
+
+---
+
+## 5. 战斗子状态机
+
+```
+                         ┌──────────┐
+        from DEFEND ───→│  SCOUT   │←──────────── 超时(10s追踪/30s交火)
+                         └────┬─────┘
+                              │ enemy_detected
+                         ┌────▼─────┐
+                    ┌───→│  TRACK   │── distance < 3m ──→ ┌─────────┐
+                    │    └────┬─────┘                      │ ENGAGE  │
+                    │         │ under_attack               └────┬─────┘
+                    │    ┌────▼─────┐  1s 安全                 │ under_attack
+                    │    │  EVADE  │─────────→────────┐       │
+                    │    └─────────┘                  │  ┌────▼─────┐
+                    │                                 └─→│  EVADE  │
+                    │                                    └─────────┘
+       aerial_threat → ┌──────────┐  15s     ┌──────────────┐
+                       │ HARDEN   │─────────→│ EVADE_AIR    │── 无威胁 → SCOUT
+                       └──────────┘          └──────────────┘
+```
+
+| 子状态 | 行为 | 姿态 | 移动 | 超时 |
+|--------|------|------|------|------|
+| SCOUT | 沿 defend_fallback 巡逻搜索 | DEFENSIVE | defend_fallback 路线 | — |
+| TRACK | 朝敌人方向追击，缩短距离 | DEFENSIVE→OFFENSIVE(接近时) | 向最近敌人方向移动 | 10s → SCOUT |
+| ENGAGE | 停住交火 | OFFENSIVE | 不动 | 30s → SCOUT |
+| EVADE | 切进攻姿态立刻反击 | OFFENSIVE | 不动 | 1s 安全 → SCOUT |
+| HARDEN | 强化防御抵抗空中威胁 | ENHANCED_DEFENSIVE | 向 safe_cover 移动 | 15s → EVADE_AIR |
+| EVADE_AIR | 防空闪避 | DEFENSIVE | 向 safe_cover 移动 | — |
+
+---
+
+## 6. 代码架构
 
 ```
 sentry_decision/
-├── CMakeLists.txt               # ament_cmake, 编译为 shared_library + rclcpp component
-├── package.xml                  # 依赖: rclcpp, nav2_msgs, rm_interfaces, yaml-cpp
+├── CMakeLists.txt                 # ament_cmake, shared_library + rclcpp component
+├── package.xml                    # 依赖: rclcpp, nav2_msgs, rm_interfaces, yaml-cpp
 ├── .clang-format
 ├── include/sentry_decision/
-│   ├── types.hpp                # 枚举、结构体、阈值默认值
-│   ├── context.hpp              # Context: 比赛状态聚合器 (裁判+敌人+导航)
-│   ├── profile.hpp              # Profile: YAML → 内存结构, load_profile()
-│   ├── fsm.hpp                  # DecisionFsm: 状态转移 + 行为执行
-│   └── decision_node.hpp        # DecisionNode: ROS2 节点, 订阅/发布/定时器
+│   ├── types.hpp                  # 枚举、结构体、阈值默认值
+│   ├── context.hpp                # Context: 比赛状态聚合器 (裁判+敌人+导航+位置)
+│   ├── profile.hpp                # Profile: YAML → 内存结构
+│   ├── fsm.hpp                    # DecisionFsm: 状态转移 + 行为执行
+│   └── decision_node.hpp          # DecisionNode: ROS2 节点
 ├── src/
-│   ├── profile.cpp              # YAML 解析 (yaml-cpp)
-│   ├── fsm.cpp                  # FSM 实现: select_state + 6 behave_* + 6 combat_*
-│   └── decision_node.cpp        # 节点实现: 订阅、action client、motion_state 解析
+│   ├── profile.cpp                # YAML 解析 (yaml-cpp)
+│   ├── fsm.cpp                    # FSM 实现: select_state + 6 behave_* + 6 combat_*
+│   └── decision_node.cpp          # 节点: 订阅、action client、motion_state 解析
 ├── config/profiles/
-│   ├── rmuc_red.yaml
-│   ├── rmuc_blue.yaml
-│   └── rmul.yaml
+│   ├── rmuc_red.yaml / rmuc_blue.yaml / rmul.yaml
 ├── launch/sentry_decision_launch.py
-└── test/fsm_test.cpp            # 20 个 gtest 单元测试
+└── test/fsm_test.cpp              # 31 个 gtest 单元测试
 ```
 
-### 2.1 types.hpp — 类型定义
+### 6.1 types.hpp — 类型定义
 
 | 类型 | 说明 |
 |------|------|
-| `Waypoint {x, y, dwell_s}` | 导航目标点，不含朝向（云台自瞄独立于底盘） |
+| `Waypoint {x, y, dwell_s}` | 导航目标点（不含朝向，云台自瞄独立于底盘） |
 | `Route = vector<Waypoint>` | 路径点序列 |
 | `State` (enum) | IDLE / PATROL / DEFEND / ATTACK_PUSH / RESUPPLY / RETREAT |
 | `CombatSubState` (enum) | SCOUT / TRACK / ENGAGE / EVADE / HARDEN / EVADE_AIR |
 | `NavStatus` (enum) | IDLE / MOVING / ARRIVED / STUCK / FAILED |
 | `AttackSource` (enum) | NONE / GROUND / AERIAL |
 | `StanceCommand` (enum) | NONE / OFFENSIVE / DEFENSIVE / MOBILITY / ENHANCED_* ×3 |
-| `EnemyInfo` | 敌人语义快照（detected, distance, count, near_base 等） |
-| `SentryInfo` | 哨兵自身语义快照（disengaged, stance, enhanced_timer） |
-| `Thresholds` | 全部数值阈值，带默认值 |
+| `EnemyInfo` | 敌人语义快照（detected, nearest_distance, nearest_x/y, count, aerial_threat 等） |
+| `SentryInfo` | 哨兵自身语义快照 |
+| `Thresholds` | 全部数值阈值，带默认值，YAML 可覆盖 |
 
-### 2.2 context.hpp — Context（状态聚合器）
+### 6.2 context.hpp — Context（状态聚合器）
 
-无 ROS 依赖，纯 C++ 数据聚合。通过 `update()` 重载方法注入裁判/敌人/哨兵信息：
+无 ROS 依赖，纯 C++ 数据聚合。关键方法：
 
-- **裁判信息**: `GameStatus`, `RobotStatus`, `RfidStatus`, `GameRobotHP`
-- **感知信息**: `EnemyInfo`, `SentryInfo`
-- **导航状态**: `NavStatus` 由 `DecisionNode` 的回调设置
-- **时间**: `set_now(double)` 注入仿真/墙上时间（支持 sim time）
+**裁判相关**: `game_running()`, `remain_time()`, `late_game()`, `referee_fresh()`, `hp()`, `hp_critical()`, `hp_low()`, `ammo()`, `ammo_empty()`, `barrel_heat()`, `overheat_risk()`, `needs_resupply()`, `under_attack()`, `attack_direction()`, `gold()`
 
-关键推导方法:
-- `game_running()`: 比赛进行中 + 剩余时间合法
-- `needs_resupply()`: 弹药空 || HP 低于阈值
-- `hp_critical()`: HP 低于致命线
-- `under_attack()`: 扣血原因为 ARMOR_HIT
-- `attack_direction()`: 根据被打装甲板 ID 推断方向
-- `late_game()`: 剩余时间 < 60s
+**感知相关**: `enemy_detected()`, `enemy_distance()`, `nearest_enemy_x()`, `nearest_enemy_y()`, `enemy_count()`, `under_aerial_attack()`, `double_vulnerability_active()`
 
-### 2.3 profile.hpp / profile.cpp — YAML 配置
+**导航相关**: `nav_status()`, `nav_stuck()`, `goal_reached()`, `set_nav_status()`
 
-`load_profile(path)` 解析 YAML 生成 `Profile` 结构体：
+**位置相关**: `sentry_x()`, `sentry_y()`, `set_sentry_position()`（odom 回调填充）
 
-```yaml
-thresholds: {hp_low, hp_critical, heat_max, ammo_min, ...}
-patrol: [{x, y, dwell_s}, ...]
-attack_push: [{x, y, dwell_s}, ...]
-defend_fallback: [...]    # 解析了但 FSM 里没使用
-supply: {x, y}
-retreat: {x, y}
-safe_cover: {x, y}
-enable_attack_push: bool
-backup_supply_points: [...]
-backup_retreat_points: [...]  # 解析了但 FSM 里没使用
-late_game_leading:  {disable_attack_push, fallback_patrol}  # 解析了但 FSM 没使用
-late_game_trailing: {disable_attack_push, fallback_patrol}  # 解析了但 FSM 没使用
-```
+**场地相关**: `outpost_alive()`, `ally_base_hp()`, `on_supply_pad()`, `on_base_gain_point()`
 
-### 2.4 fsm.hpp / fsm.cpp — 核心 FSM
+### 6.3 fsm.cpp — 核心 FSM
 
-**输入**: `Context & ctx`, `double now_s` (每 tick 调用)  
-**输出**: 调用 `GoalPublisher` 发 waypoint / `StanceSender` 发 stance / `NavCanceller` 取消导航
+**tick()**: select_state → can_leave_current_state → on_exit/on_enter → run_behaviour
 
-**状态转移优先级** (select_state 顺序):
+**select_state()**: 8 级优先级链，每 tick 重新评估。RETREAT/RESUPPLY 有 hysteresis。
 
-```
-referee 掉线/比赛未开始  → IDLE
-当前在 RETREAT 且 HP 仍很低  → RETREAT (滞回)
-HP 致命                   → RETREAT
-空中威胁                  → DEFEND
-当前在 RESUPPLY 且仍需补给  → RESUPPLY (滞回)
-需要补给                  → RESUPPLY
-敌人发现/正在被攻击        → DEFEND
-允许推进                  → ATTACK_PUSH
-默认                      → PATROL
-```
+**战斗 FSM (run_combat_fsm)**: 6 个子状态，由 behave_defend 驱动。
 
-**状态切换 hysteresis (can_leave_current_state)**:
-- 可以无条件离开 IDLE、进入安全状态 (IDLE/RETREAT/DEFEND)
-- RESUPPLY 可以抢断除 RETREAT 外的任何状态
-- 其他状态间切换需要 `ticks_in_state_ >= min_ticks_in_state`（防止抖动）
+---
 
-**route 推进逻辑 (drive_route)**:
-```
-goal 未发出 → 发送当前 waypoint → 等待到达 → 等待 dwell_s → 推进 index → 循环
-```
+## 7. 稳定性和鲁棒性
 
-**战斗子状态 FSM (run_combat_fsm)**:
+### 7.1 防振荡
 
-```
-                          ┌──────────┐
-         from DEFEND ───→│  SCOUT   │
-                          └────┬─────┘
-                               │ enemy_detected
-                          ┌────▼─────┐
-                          │  TRACK   │──────── distance < engage ──→ ┌─────────┐
-                          └────┬─────┘                                │ ENGAGE  │
-                               │ under_attack                         └────┬─────┘
-                          ┌────▼─────┐  2s safe                          │ under_attack
-                          │  EVADE   │─────────→ SCOUT                  │
-                          └──────────┘                              ┌────▼─────┐
-                                                                    │  EVADE   │
-        aerial_threat ──→ ┌──────────┐                              └──────────┘
-                          │  HARDEN  │── timer_expired ──→ ┌──────────────┐
-                          └──────────┘                     │ EVADE_AIR    │── no threat → SCOUT
-                                                           └──────────────┘
-```
+- **State hysteresis**: RETREAT 进入 hp<60，退出 hp≥120；RESUPPLY 进入 hp<150/弹药空，退出 hp≥400 或弹药补满
+- **min_ticks_in_state**: 普通状态最小停留 4 tick（400ms），防止瞬态抖动
+- **stance 冷却**: 5s，DEFENSIVE/ENHANCED_DEFENSIVE 可绕过
+- **RESUPPLY 冷却**: 补给点全部失败后 15s 不重试（弹药空绕过），防止 PATROL↔RESUPPLY 死循环
+- **补给到达重置**: RFID 确认到达补给区后重置失败标记，允许下次正常补给
 
-### 2.5 decision_node.hpp / decision_node.cpp — ROS2 节点
+### 7.2 数据安全
 
-**订阅:**
-| Topic | 类型 | 用途 |
-|-------|------|------|
-| `referee/game_status` | GameStatus | 比赛阶段/剩余时间 |
-| `referee/robot_status` | RobotStatus | HP/弹药/热量/扣血原因 |
-| `referee/rfid_status` | RfidStatus | RFID 增益点/补给区 |
-| `referee/all_robot_hp` | GameRobotHP | 前哨站/基地血量 |
-| `motion_manager/state` | String | 解析运动状态 (stuck/recovery/mode) |
+- **裁判 stale 超时**: 3s 无数据 → IDLE，停止所有导航
+- **EnemyInfo 过期**: 1s 无新数据自动清除（可配 `enemy_stale_timeout_s`）
+- **motion_state 加固**: 词边界检查 + 连续 3 次 idle 才判 FAILED
+- **所有数据访问**: `std::optional` 保护，null 时返回安全默认值
+- **自瞄+雷达数据融合**: 自瞄做近距离检测（detected/distance），雷达提供全局坐标（nearest_x/y）。自瞄更新时保留雷达坐标不覆盖
 
-**发布 / Action:**
-- **Nav2 Action**: `navigate_to_pose` (带 `PoseStamped` topic fallback)
-- **Topic**: `/goal_pose` (fallback 模式)
-- **Stance**: STUB，仅 log 输出
+### 7.3 导航容错
 
-**关键参数 (ros2 param):**
+- **Nav2 action 可用**: 正常走 Action 协议（feedback/result 回调）
+- **Nav2 action 不可用**: 自动 fallback 到 PoseStamped topic + odom 距离到达检测
+- **导航卡住**: 跳下一个路点
+- **cancel_nav 清理**: Nav2 在线和离线模式均正确清理标志位
+- **空 route 保护**: `drive_route` 和 `publish_single_goal` 均有空检查和重复发送防护
+
+### 7.4 边界保护
+
+- **Waypoint 到达**: dwell 计时从到达后才开始，未到达不推进
+- **path_idx 回绕**: 到达路线末尾自动循环
+- **作战超时**: TRACK 10s / ENGAGE 30s → fallback SCOUT
+- **撤退多级兜底**: 主撤退点 → 备用撤退点链 → safe_cover → 原地不动
+- **补给多级兜底**: 主补给点 → 备用补给点链 → 冷却 → 重试
+
+---
+
+## 8. 修改日志
+
+### 2026-07-07 稳定性修复（本轮）
+
+#### 8.1 RESUPPLY 防死循环振荡
+`on_enter(RESUPPLY)` 不再重置 `supply_backup_exhausted_`。新增 15s 冷却期（`supply_retry_cooldown_s`），补给全部失败后有弹药时冷却期内不重试。到达补给区（RFID 确认）后重置。弹药耗尽时绕过冷却。
+
+#### 8.2 EVADE 切进攻姿态反击
+`combat_evade()` 不再往掩体跑（RM 场地无掩体），改为切 OFFENSIVE 姿态立刻还击。1s 未被打返回 SCOUT 继续搜索。
+
+#### 8.3 TRACK 主动追击
+`combat_track()` 根据雷达提供的敌方全局坐标，计算追击目标点（追到 engage_distance 为止），主动缩短距离。不再原地等待。`EnemyInfo` 新增 `nearest_x`/`nearest_y` 字段。
+
+#### 8.4 EnemyInfo 可配置过期时间
+从硬编码 0.5s 改为 YAML 可配 `enemy_stale_timeout_s`，默认 1.0s。
+
+#### 8.5 cancel_nav fallback 清理
+Nav2 不可用时 `cancel_nav()` 也正确清理 `nav_goals_active_` 和 `fallback_goal_active_`，防止 on_tick 用旧坐标做到达检测。
+
+#### 8.6 自瞄不覆盖雷达坐标
+`auto_aim_target_callback` 更新前从 Context 读取现有 `nearest_x`/`nearest_y`，保留雷达提供的全局坐标。
+
+#### 8.7 导航卡住时 goal 清理
+`combat_track` 和 `combat_evade_air` 在 `nav_stuck` 时先设 `goal_sent_=false`，确保新目标能正常发出。
+
+### 2026-07-05 历史修改
+
+- 基础稳定性修复（now()、RFID、空 route、hysteresis、姿态冷却去重）
+- 自瞄 String 输入接入
+- 雷达 EnemyPosition 输入接入
+- motion_state 结构化 topic（String fallback 保留）
+- 0x0120 下行 sentry_cmd（ROS 端已通）
+- FSM 战术改进（ATTACK_PUSH 被攻即退、RESUPPLY 失败兜底、RETREAT 备用路线、DEFEND 防守巡逻、late_game 策略、Combat SubState 超时）
+- Nav2 fallback 到达检测（odom 距离判断）
+
+---
+
+## 9. 问题状态
+
+| 编号 | 问题 | 状态 |
+|------|------|------|
+| 9.1 | STM32 未解析 0xB6 | 待电控配合 |
+| 9.2 | 0x020D 脱战/姿态反馈未接入 | 待电控 + serial_driver |
+| 9.3 | 0x020C 空中威胁来源未接入 | 可选 |
+| 9.4 | Profile 坐标未确认 | 待实车地图 |
+| 9.5 | 自瞄结构化 Target 开关未开 | 待自瞄同学 |
+| 9.6 | 多敌人决策退化 | 低优先级 |
+| 9.7 | 己方队友协同 | 远期规划 |
+| 9.8 | 热管理优化 | 远期规划 |
+| 9.9 | RFID 增益点策略 | 远期规划 |
+
+---
+
+## 10. 可配置参数
+
+### YAML thresholds（默认值，可在 profile YAML 中覆盖）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `hp_low` | 150 | 低血量阈值 |
+| `hp_critical` | 60 | 致命血量阈值 |
+| `hp_low_exit_hysteresis` | 180 | 低血量退出滞后 |
+| `hp_critical_exit` | 120 | 致命血量退出滞后 |
+| `heat_max` | 240 | 过热阈值 |
+| `ammo_min` | 1 | 弹药耗尽阈值 |
+| `game_total_time` | 420 | 比赛总时长(s) |
+| `min_ticks_in_state` | 4 | 状态最小停留 tick 数 |
+| `referee_stale_timeout_s` | 3.0 | 裁判数据过期时间(s) |
+| `enemy_stale_timeout_s` | 1.0 | 敌方数据过期时间(s) |
+| `supply_retry_cooldown_s` | 15.0 | 补给失败后冷却时间(s) |
+| `engage_distance` | 3.0 | 交火距离(m) |
+| `track_distance` | 8.0 | 追踪距离(m) |
+| `stuck_timeout_s` | 30.0 | 导航卡住超时(s) |
+| `resupply_timeout_s` | 60.0 | 单次补给超时(s) |
+| `retreat_timeout_s` | 90.0 | 单次撤退超时(s) |
+| `enemy_lost_time_s` | 5.0 | 敌人丢失超时(s) |
+| `enhanced_defense_duration_s` | 15.0 | 强化防御持续时间(s) |
+
+### ROS2 参数
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `profile_path` | (必填) | YAML tactic 文件路径 |
@@ -221,363 +276,124 @@ goal 未发出 → 发送当前 waypoint → 等待到达 → 等待 dwell_s →
 | `nav_action_name` | `navigate_to_pose` | Nav2 action 名称 |
 | `goal_frame` | `map` | goal 坐标帧 |
 | `goal_reached_distance_tolerance` | 0.25 m | 到达判定距离 |
+| `motion_state_topic` | `motion_manager/state` | 运动状态话题（String） |
+| `auto_aim_target_topic` | `auto_aim_target_pos` | 自瞄目标话题 |
 
 ---
 
-## 3. 当前存在的问题（需修复）
+## 11. 编译与运行
 
-### 3.1 :green_circle: `send_stance_command` 已打通（ROS 端）
+```bash
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select rm_interfaces radar_msgs sentry_decision
 
-```cpp
-// decision_node.cpp 发布 sentry/command (SentryCommand)
-// serial_driver 订阅后打包为 0xB6 自定义串口包下发 STM32
+# 测试
+source ~/Sentry26/install/setup.bash
+ctest --test-dir ~/Sentry26/build/sentry_decision
 ```
 
-**已完成**:
-- 新增 `rm_interfaces/msg/referee/SentryCommand.msg`，覆盖 0x0120 全部字段（confirm_revive、confirm_instant_revive、projectile_exchange_amount、remote_projectile_exchange_count、remote_hp_exchange_count、stance_command、activate_energy_mechanism）。
-- `sentry_decision` 的 `send_stance_command()` 现已发布 `sentry/command` topic，不再是纯日志 STUB。
-- `serial_driver` 新增 `HEADER_SENTRY_CMD = 0xB6` 下行包，订阅 `sentry/command` 并打包通过串口发送给 STM32。
-- 已通过 ROS2 topic 模拟验证整条链路。
+```bash
+# 红方
+ros2 run sentry_decision sentry_decision_node --ros-args \
+  -p profile_path:=~/Sentry26/src/sentry_decision/config/profiles/rmuc_red.yaml
 
-**剩余依赖**:
-- STM32 侧需要新增 `0xB6` 包解析，并转换为 RM2026 裁判系统 `0x0120 sentry_cmd` 发送。这部分属于电控固件，不在 ROS 端修改范围内。
-- `sentry/command` 目前只填充 `stance_command` 字段，远程兑换血量/弹量、确认复活等字段尚未由 FSM 逻辑驱动。
-
-### 3.2 :yellow_circle: `EnemyInfo` 已接入自瞄 + 雷达双源
-
-```cpp
-// 近距离：订阅 auto_aim_target_pos (std_msgs/String: "x,y,valid,id")
-// 全局：  订阅 radar/enemy_positions (rm_interfaces/EnemyPosition: x, y, robot_type)
+# 蓝方
+ros2 run sentry_decision sentry_decision_node --ros-args \
+  -p profile_path:=~/Sentry26/src/sentry_decision/config/profiles/rmuc_blue.yaml
 ```
 
-**已完成**:
-- 自瞄输入（近距离）：`DecisionNode` 新增 `auto_aim_target_topic` 参数，默认 `auto_aim_target_pos`。解析 `x,y,valid,id` 转为 `EnemyInfo`。
-- 雷达输入（全局坐标）：`DecisionNode` 新增 `radar/enemy_positions` 订阅，聚合 6 个 `EnemyPosition` 为 `EnemyInfo`。
-- 雷达站（`RM2026_BOF_Radar`）新增 `ros_publisher.py`，惰性初始化 ROS2 发布桥接。
-- `rm_interfaces` 新增 `EnemyPosition.msg`。
+## 12. 其他文档
 
-**剩余影响/限制**:
-- 自瞄仍是字符串解析，坐标是云台坐标系，只能做近距离（~8m）判断。
-- 雷达给全局 map 坐标，可判断 `enemy_near_base/near_outpost`（需 profile 配置 base/outpost 参考坐标）。
-- `under_aerial_attack()` 和 `double_vulnerability_active()` 仍缺真实雷达/裁判系统来源（需 0x020C）。
-
-**优先级**: 中。短期已可支撑近距离 `DEFEND/TRACK/ENGAGE`；中期建议让自瞄新增结构化 `rm_interfaces/msg/vision/Target` topic，长期仍需要雷达/0x0301 或全局敌方坐标。
-
-### 3.3 :red_circle: `SentryInfo` 从未被填充
-
-```cpp
-// 没有 subscriber 或 serial parsing 填充 SentryInfo
-```
-
-**影响**:
-- `stance_expiring()` 固定返回 false
-- `enhanced_defense_remaining()` 返回 0.0（导致 HARDEN 计时完全依赖 FSM 内部 clock，无法反映实际增强防御剩余时间）
-
-**优先级**: 中。需要串口 0x0120 uplink 或对应 ROS topic。
-
-### 3.4 :yellow_circle: motion_state 解析已加固，但仍建议结构化消息
-
-```cpp
-// decision_node.cpp: motion_state_callback 和 contains_token
-```
-
-**已完成**:
-- `contains_token()` 增加词边界检查（左右需空格/逗号/字符串首尾）。
-- `mode=idle` 需连续 3 次才判 `FAILED`，防止瞬态误报。
-
-**剩余**: 仍建议 `motion_manager` 发布结构化消息。
-
-### 3.5 :yellow_circle: late_game 策略已启用
-
-```cpp
-// fsm.cpp: attack_push_allowed() 使用 profile_.late_game_leading.disable_attack_push
-//          behave_patrol() 在后期使用 fallback_patrol 路线
-```
-
-**已完成**:
-- `attack_push_allowed()` 在后期读取 `late_game_leading.disable_attack_push` 配置。
-- `behave_patrol()` 在后期自动切换 `fallback_patrol` 路线（若配置）。
-
-**剩余**: 暂不支持自动检测领先/落后（需敌方基地血量，当前 rm_interfaces 无此字段）。
-
-### 3.6 :green_circle: defend_fallback 已启用
-
-`combat_scout()` 在未发现敌人时，使用 `defend_fallback` 路线进行防守巡逻。
-
-### 3.7 :green_circle: backup_retreat_points 已启用
-
-`behave_retreat()` 在 nav_stuck 或 timeout 时，会依次尝试 `backup_retreat_points` 和 `safe_cover`。
-
-### 3.8 :green_circle: topic fallback 路径到达检测
-
-```cpp
-// on_tick() 中 fallback 模式下用 odom 距离判断到达：
-// hypot(current_x - goal_x, current_y - goal_y) <= 0.25 → ARRIVED
-```
-已添加 odom 订阅和 fallback 距离检测，不再依赖 Nav2 feedback。
-
+| 文档 | 内容 |
+|------|------|
+| `README.md` | 项目概览 |
+| `docs/interface_audit.md` | 接口审计 |
+| `docs/profile_coordinates.md` | Profile 坐标填写 |
+| `docs/测试指南.md` | 测试说明 |
+| `docs/changes/` | 历次修改日志 |
 
 ---
 
-## 3.9 问题汇总清单
+## 13. 待实战/仿真闭环验证的风险点
 
-| 编号 | 问题 | 状态 | 优先级 |
-|------|------|------|--------|
-| 3.1 | `send_stance_command` 0x0120 下行 | ROS 端已打通，STM32 待配合 | 高 |
-| 3.2 | `EnemyInfo` 自瞄输入 | 已接入 String，缺结构化消息和全局坐标 | 中 |
-| 3.3 | `SentryInfo` / 0x020D | 未接入，无姿态/脱战/强化剩余时间反馈 | 高 |
-| 3.4 | `motion_state` 字符串解析 | 已加固（边界检查+连续确认），仍建议结构化 | 中 |
-| 3.5 | `late_game` 策略 | 已启用，暂缺敌方基地血量无法自动判断领先/落后 | 中 |
-| 3.6 | `defend_fallback` route | 已使用 | **已解决** |
-| 3.7 | `backup_retreat_points` | 已使用 | **已解决** |
-| 3.8 | topic fallback 到达检测 | 已添加 odom 距离检测 | **已解决** |
-| 新 | `ATTACK_PUSH` 被攻击时退出 | 已增加 `!under_attack()` 条件 | **已解决** |
-| 新 | `RESUPPLY` 失败兜底 | 补给全部超时后仅 hp_critical 保持 | **已解决** |
-| 新 | `RETREAT` stuck/timeout 兜底 | 依次尝试 backup → safe_cover | **已解决** |
-| 新 | `Combat SubState` 超时保护 | TRACK 20s / ENGAGE 30s → fallback SCOUT | **已解决** |
-| 新 | `裁判 stale timeout` 参数化 | 从硬编码 3.0s 改为 `referee_stale_timeout_s` 参数 | **已解决** |
-| 5.1 | Nav2 action 宕机恢复 | fallback 模式已加 odom 到达检测与 goal 清理 | **已解决** |
-| 5.4 | 多敌人决策退化 | 只知道最近敌人，无法评估整体威胁 | 低 |
-| 5.5 | dwell 时间窗口 | 巡逻驻留期间可能延迟响应 | 低 |
-| 5.6 | Waypoint 无朝向 | Nav2 可能选择次优路径方向 | 低 |
+以下问题代码静态审查无法发现，需要在仿真或实车环境下闭环测试才能暴露。
 
+### 13.1 数据竞态：自瞄与雷达到达顺序不确定
 
----
+**问题**: `auto_aim_target_callback` 和 `radar_callback` 各自创建完整 `EnemyInfo` 后调用 `context_.update()` 全量替换。虽然已保护自瞄不覆盖雷达坐标，但两个源到达顺序不确定时，`detected` / `count` / `nearest_distance` 等字段会被最后一个到达的来源覆盖。
 
-## 4. 可优化方案
+**风险**: 雷达报告 3 个敌人，自瞄只报告 1 个近距离目标。如果自瞄在雷达之后到达，`count` 从 3 变成 1，`nearest_distance` 从雷达的全局距离变成自瞄的云台相对距离。F SM 可能丢失多敌人感知。
 
-### 4.1 :bulb: 敌人状态估计（Kalman/Particle Filter）
+**验证方式**: 仿真中同时运行雷达和自瞄，观察 `sentry/command` 输出和 FSM 状态日志，确认 EnemyInfo 不会在两个源之间抖动。
 
-当前 `EnemyInfo` 只有 `nearest_distance`。可扩展为含速度估计的结构体，实现：
-- 预判敌人移动路径 → ENGAGE 状态下主动拦截而非被动跟随
-- 在 EVADE 状态下选择远离敌人方向而非固定 retreat 点
+**修复方向**: 两个回调不各自创建完整 EnemyInfo，改为更新各自负责的字段子集。Context 提供增量更新接口。
 
-### 4.2 :bulb: attack_direction 驱动的动态撤退方向
+### 13.2 TRACK 追击在真实雷达数据下的流畅性
 
-```cpp
-// context.hpp:119-133 attack_direction() 已实现
-double attack_direction() const {
-  switch (hit_armor_id()) {
-    case 0: return 0.0;             // 前方中弹 → 正后方撤退
-    case 1: return π/2;              // 左侧中弹 → 右后方撤退
-    case 2: return π;                // 后方中弹 → 前方撤退
-    case 3: return -π/2;             // ...
-  }
-}
-```
+**问题**: `combat_track` 每次 tick 重新计算追击目标点。如果雷达更新频率低（如 1-5Hz）或坐标有噪声，追击目标可能抖动。频繁更换 Nav2 goal 会增加路径重规划开销。
 
-RETREAT 时可计算动态撤退目标点 = `current_pose + retreat_distance * direction_vector`，而非固定 `profile_.retreat` 点。
+**风险**: 追击路径不稳定，机器人来回转向，能耗增加；极端情况下可能追丢敌人。
 
-### 4.3 :bulb: 经济感知决策
+**验证方式**: 仿真中放置移动的敌方机器人，开启雷达数据注入，观察哨兵追击轨迹是否平滑、是否稳定进入 ENGAGE。
 
-`Context::gold()` 已实现但没有被任何决策逻辑使用。可以：
-- 金币足够时购买更快射击/恢复 → 自动切换为 ENHANCED_OFFENSIVE
-- 金币不足时更保守 → 禁用 attack_push
+**修复方向**: 对追击目标点做低通滤波（滑动平均），或设置最小 goal 更新间隔。
 
-### 4.4 :bulb: 己方队友协同
+### 13.3 连续战斗中的子状态振荡
 
-当前 FSM 只知道己方机器人血量和己方前哨站/基地血量，不知道己方英雄、工程、步兵的实时位置，因此还不能判断队友是否在守基地、前压或占补给区。
+**问题**: 战斗子状态 FSM 在边界条件下可能振荡。例如：敌人在 3m 临界距离反复进出 → TRACK↔ENGAGE 来回切。自瞄间歇性丢帧 → enemy_detected 闪烁 → SCOUT↔TRACK 来回切。
 
-可优化方向：
-- 己方英雄/步兵前压时，哨兵可提高 ATTACK_PUSH 意愿。
-- 己方基地附近无人且敌方接近时，哨兵优先 DEFEND/RETREAT 到基地防守点。
-- 工程机器人在补给区或兑换区附近时，哨兵避免抢占补给路线。
-- 己方主要输出机器人残血时，哨兵减少前压，补防关键通道。
+**风险**: 姿态命令频繁切换（DEFENSIVE↔OFFENSIVE），导航 goal 反复取消重发，整体效率降低。
 
-依赖接口：
-- 0x020B 己方地面机器人位置。
-- GameRobotHP 己方机器人血量。
-- 雷达/自瞄/交互数据提供的敌方位置。
+**验证方式**: 仿真中模拟边界距离的敌人，观察子状态切换频率。如果某个子状态在 1 秒内切换超过 3 次，需要加 hysteresis。
 
-### 4.5 :bulb: 热管理优化
+**修复方向**: 为子状态切换添加 min_ticks 或阈值滞回（如进入 ENGAGE 需要 <2.5m，退出需要 >3.5m）。
 
-当前只有 `overheat_risk()` 二元判断。可优化为：
-- 热量 < 50% → 允许连续射击
-- 热量 50-80% → 限制射击频率 (切换到 burst mode)
-- 热量 > 80% → 触发 EVADE 主动冷却
+### 13.4 motion_state 双通道竞争
 
-### 4.6 :bulb: Combat SubState 超时保护
+**问题**: `motion_state_structured_callback` 和 `motion_state_callback` 同时订阅两个 topic（结构化 + String）。如果 motion_manager 同时发布两个 topic，两者的到达顺序不确定，`nav_status` 可能由最后到达的消息决定。共享的 `idle_detection_counter_` 可能被两个回调交替重置，导致 FAILED 判定延迟或误判。
 
-当前 SCOUT / TRACK / ENGAGE 子状态没有退出超时——如果敌人距离卡在阈值边界，可能无限抖振。建议添加：
-- ENGAGE 最长时间 (如 30s) → auto fallback to SCOUT
-- TRACK 敌人但长时间不进入 ENGAGE → auto fallback to PATROL
+**风险**: 导航明明在正常运行，但被 String 通道的旧数据误判为 FAILED → 路由跳点。或者导航真的卡住了，但结构化通道一直重置计数器 → 迟迟不跳点。
 
-### 4.7 :bulb: RFID 增益点策略
+**验证方式**: 确认 motion_manager 实际只发布一个通道。如果两个都发，在仿真中制造导航卡住场景，验证 FAILED 检测的延迟是否在接受范围内（当前需连续 3 次 idle，约 300ms）。
 
-当前 `on_base_gain_point()` 已实现但未被使用。可添加：
-- 巡逻路线包含增益点 → 每 N 圈刷新一次 buff
-- ATTACK_PUSH 前检查是否有活跃增益
+**修复方向**: 如果 motion_manager 只发一个通道，删除另一个订阅。如果两个都发，将计数器按通道独立。
 
----
+### 13.5 Nav2 action server 宕机恢复
 
-## 5. 潜在风险与边界情况
+**问题**: Nav2 宕机时 decision 自动 fallback 到 PoseStamped topic + odom 到达检测。如果 Nav2 恢复，下一帧 `publish_goal` 会切换到 action 模式。但此时上一个 `current_goal_handle_` 可能指向已失效的 goal。
 
-### 5.1 :warning: FSM 无异常恢复机制
+**风险**: Nav2 恢复后第一个 action goal 可能被拒绝（服务端状态不一致）。当前代码中 goal 被拒时设置 NavStatus::FAILED → FSM 走 nav_stuck 重发 goal → 第二次通常成功。影响为一帧延迟。
 
-如果 Nav2 action server 宕机，`publish_goal()` fallback 到 topic 模式，但：
-- fallback 模式没有到达回调 → 永远不会 `goal_arrived_=true`
-- resume 后 ACTION 重新可用时，`current_goal_handle_` 可能指向上一个已失效的 goal
+**验证方式**: 仿真中手动 kill/restart Nav2 action server，确认决策在 1 秒内恢复正常工作。
 
-### 5.2 :warning: RESUPPLY 仅依赖 waypoint 到达
+**修复方向**: 检测到 action server 状态从 down→up 时主动 `async_cancel_all_goals` 清理服务端状态。
 
-`behave_resupply()` 发布 supply 点 goal，等待 `goal_arrived_`。但：
-- 实际补给通过 RFID 确认 (`on_supply_pad()`)
-- 如果导航到达了但 RFID 没触发（sensor 误差），会一直卡在 RESUPPLY
-- `resupply_timeout_s` 只能切换到 backup 点，没有 fallback 到 PATROL 的路径
+### 13.6 补给区 RFID 触发延迟
 
-### 5.3 :warning: ATTACK_PUSH 无撤退路径
+**问题**: `behave_resupply` 中 `ctx.on_supply_pad()` 依赖 RFID 检测。RFID 是物理感应，可能有 0.5-1 秒延迟。在这段延迟期间，机器人已到达补给区坐标但未被识别为"已到达"。
 
-如果推进过程中被反击（hp 快速下降），只有等到 hp_critical 才会触发 RETREAT。hp_low 期间（150-60）仍然继续推进，这在敌方基地附近是非常危险的。
+**风险**: 如果 `resupply_timeout_s` 设置得太短，机器人到达补给区后 RFID 还没触发就被判超时，切到备用补给点。但如果机器人确实没到达（导航误差），适当超时又是必要的。
 
-### 5.4 :warning: 多个 enemy 时的决策退化
+**验证方式**: 实车测试中在补给区放置 RFID 卡，测量从 goal 到达（Nav2 succeeded）到 RFID 触发（on_supply_pad 变 true）的延迟。调整 `resupply_timeout_s` 使其至少为此延迟的 2 倍。
 
-```cpp
-// fsm.cpp:237 combat_scout — enemy_detected 只检查 bool
-if (ctx.enemy_detected()) { combat_substate_ = CombatSubState::TRACK; }
-```
+**修复方向**: 结合 goal 到达（odom 距离）+ RFID 双重确认，而非仅依赖 RFID。
 
-多个敌人时 `enemy_distance()` 返回最近的，但 FSM 不知道是否有更远的敌人正在接近（无法评估整体威胁）。
+### 13.7 无 motion_state 数据时的行为退化
 
-### 5.5 :warning: dwell_s 导致的时间窗口
+**问题**: 如果 motion_manager 完全不发数据，`nav_status` 始终为 IDLE。FSM 的路由推进依赖 `goal_arrived_` → `goal_reached()` → `nav_status == ARRIVED`。唯一能设置 ARRIVED 的是 Nav2 feedback 回调和 fallback odom 检测。如果 Nav2 也不可用，odom 检测需要机器人正好走到目标坐标 0.25m 以内。
 
-巡逻到达 waypoint 后停留 `dwell_s` 秒，期间如果比赛事件发生（enemy detected / hp drop），`can_leave_current_state` 检查 `min_ticks_in_state` 可能导致响应延迟（10Hz tick × 4 ticks = 400ms 最坏延迟）。
+**风险**: 巡逻路线上机器人一直在移动，但 FSM 认为它从未到达，永远不会推进到下一个路点。机器人会一直朝第一个巡逻点走，撞墙后 motion_manager 可能触发 recovery。
 
-### 5.6 :warning: Waypoint 无朝向信息
+**验证方式**: 仿真中不启动 motion_manager，启动 Nav2，观察是否正常推进路线。
 
-```cpp
-// types.hpp:27-32
-struct Waypoint { double x, y, dwell_s; };  // 无朝向
-// decision_node.cpp:113
-goal_msg.pose.pose.orientation.w = 1.0;     // 固定四元数
-```
+**修复方向**: 添加纯 odom 到达检测（不依赖 fallback goal 标志）作为最后兜底。
 
-Nav2 可能选择次优路径方向（如倒着到达），因为目标无朝向约束。
+### 13.8 串口 0xB6 下行链路未验证
 
-### 5.7 :warning: 裁判数据时效性
+**问题**: decision 发布 `sentry/command` → serial_driver 打包为 0xB6 → STM32 → 裁判系统 0x0120。ROS 端已验证（topic 有发布），但 STM32 解析 0xB6 并转换为 0x0120 发送的链路**完全未测**。
 
-```cpp
-// context.hpp:55 — 3秒 stale 阈值硬编码
-bool game_status_fresh() const { return ... (now() - game_status_stamp_) < 3.0; }
-```
+**风险**: 如果 STM32 未实现 0xB6 解析或格式不匹配，所有姿态切换指令（进攻/防御/强化）全部无效。哨兵在所有状态下姿态都不会变化，可能在需要防御时不防御、需要进攻时不开火。
 
-如果裁判系统 10Hz 降到 5Hz，正常刷新也会视为 stale → 强制 IDLE。
+**验证方式**: 最优先的验证项。实车连接 STM32，在 ROS 端发布手动 `sentry/command`，通过裁判系统监控软件确认 0x0120 是否正确接收到 stance_command。
 
-### 5.8 :warning: 仿真 vs 实车差异
-
-- `Context::set_now()` 在仿真中注入 sim time，实车使用 wall time
-- `motion_state` 解析的 token 可能因 `motion_manager` 版本不同而改变
-- Stance 指令当前为 STUB，在实车上需要对接串口协议 0x0120
-
----
-
-## 6. 单元测试覆盖情况
-
-`test/fsm_test.cpp` — 20 个 gtest 用例:
-
-| 测试 | 验证内容 |
-|------|---------|
-| 基础状态转移 | IDLE, PATROL, ATTACK_PUSH, RESUPPLY, RETREAT 的条件触发 |
-| 优先级 | 致命 HP > 补给需求; 敌人发现 > 推进 |
-| Route 推进 | 到达+dwell 后 index 前进; 循环; 到达前不前进 |
-| 战斗子状态 | 距离驱动 TRACK→ENGAGE; 空中威胁→HARDEN |
-| 比赛结束 | GAME_OVER → IDLE |
-| Stale 检测 | 裁判超时 → IDLE |
-| Late game | 尾段禁用 attack_push |
-| HP 门槛 | HP 不够不触发 attack_push |
-| Stance | ENHANCED_DEFENSIVE 绕过冷却; 普通 stance 受冷却控制 |
-| 备用补给点 | timeout 后切换 |
-
-**缺失的测试覆盖:**
-- EVADE 子状态
-- EVADE_AIR 子状态
-- Stuck → route_idx 跳转
-- Retreat timeout 后行为
-- Nav 取消逻辑
-- Goal 被 Nav2 拒绝后的恢复
-
----
-
-## 7. 接入方向
-
-### 7.1 最短路径（让 FSM 实际运转）
-
-1. **EnemyInfo 自瞄输入已接入**: 当前已兼容 `auto_aim_target_pos` (`std_msgs/String`, `x,y,valid,id`)，可支撑近距离 `DEFEND/TRACK/ENGAGE`；后续仍建议改结构化消息并接雷达/全局敌方坐标
-2. **对接 stance 下发**: 实现串口 0x0120 downlink 或 `rmua19_robot_base` 的 stance command 接口
-3. **对接 motion_state**: 改用结构化消息
-
-### 7.2 结构化 motion_state 建议
-
-```cpp
-// 建议在 rm_interfaces 新增
-struct MotionState {
-  uint8 mode;            // IDLE=0, NAVIGATION=1, RECOVERY=2
-  uint8 recovery_phase;  // STRAIGHT_RELEASE=0, ARC_ESCAPE=1, ...
-  bool emergency_stop;
-  bool has_fresh_command;
-};
-```
-
-### 7.3 决策级联调流程
-
-```
-sentry_decision (this pkg)
-  ├── goal → Nav2 → motion_manager → odom
-  ├── stance → serial_driver → robot_base
-  ├── EnemyInfo ← radar/AutoAim (待接入)
-  └── SentryInfo ← serial_driver 0x0120 uplink (待接入)
-```
-
----
-
-## 8. 文件清单
-
-| 文件 | 行数 | 说明 |
-|------|------|------|
-| `types.hpp` | 166 | 所有枚举、结构体、阈值定义 |
-| `context.hpp` | 183 | 状态聚合器(头文件实现) |
-| `profile.hpp` | 55 | YAML 解析接口 + Profile 结构体 |
-| `fsm.hpp` | 103 | DecisionFsm 接口 |
-| `decision_node.hpp` | 83 | ROS2 Node 接口 |
-| `profile.cpp` | 121 | YAML → Profile 解析实现 |
-| `fsm.cpp` | 425 | 完整 FSM 逻辑 |
-| `decision_node.cpp` | 270 | ROS 订阅/发布/Nav2 Action Client |
-| `fsm_test.cpp` | 356 | 20 个 gtest 单元测试 |
-| `rmuc_red.yaml` | 51 | 红方 RMUC 配置 |
-| `rmuc_blue.yaml` | ~50 | 蓝方 RMUC 配置 |
-| `rmul.yaml` | ~50 | RMUL 配置 |
-| `sentry_decision_launch.py` | 91 | Launch 文件 |
-
----
-
-## 8. 修改日志
-
-### 2026-07-05 Bug 修复
-
-#### 8.1 combat_harden 计时修正
-`combat_harden()` 的强化防御持续时间改用 `substate_entered_s_` 而非 `state_entered_s_`。修复了 HARDEN 从 DEFEND 进入时间开始算而非从真正进入 HARDEN 子状态开始算的问题。
-
-#### 8.2 EnemyInfo 数据过期保护
-`Context` 新增 `enemy_info_fresh()`，超过 0.5s 未更新 EnemyInfo 视为过期。所有敌人查询先过新鲜度检查，防止自瞄断连后 FSM 误判敌人永远存在。
-
-#### 8.3 RESUPPLY 敌人让路
-`select_state()` 的 RESUPPLY 保持条件新增 `!ctx.enemy_detected()`。敌人出现时不再强制保持 RESUPPLY，让 guard chain 可正常回退到 DEFEND。
-
-详见: `docs/changes/2026-07-05_bug_fixes.md`
-
-### 2026-07-05 新接口接入
-
-#### 8.4 EnemyInfo 自瞄 + 雷达双源
-- 近距离：`auto_aim_target_pos`（自瞄云台坐标，字符串解析）→ EnemyInfo。
-- 全局：`radar/enemy_positions`（雷达 0x0A01 广播波解析，map 坐标）→ EnemyInfo。
-- 新增 `rm_interfaces/msg/EnemyPosition.msg`。
-- 雷达站 `RM2026_BOF_Radar` 新增惰性 ROS2 桥接（`ros_publisher.py`）。
-
-#### 8.5 motion_state 结构化
-- 新增 `rm_interfaces/msg/MotionState.msg`（含 enum 常量）。
-- `sentry_motion_manager` 新增 `motion_manager/motion_state` 结构化 topic。
-- `sentry_decision` 同时订阅 String 和结构化，结构化优先。
-
-#### 8.6 0x0120 sentry_cmd 下行打通
-- 新增 `rm_interfaces/msg/referee/SentryCommand.msg`。
-- `serial_driver` 新增 `0xB6 HEADER_SENTRY_CMD` 下行包。
-- `sentry_decision` 的 `send_stance_command()` 发布 `sentry/command` topic。
+**修复方向**: 如果 STM32 端未实现，需参照 `rm_interfaces/msg/SentryCommand.msg` 格式实现解析逻辑。

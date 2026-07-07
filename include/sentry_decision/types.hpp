@@ -122,6 +122,8 @@ struct EnemyInfo
 {
   bool detected{false};
   double nearest_distance{999.0};
+  double nearest_x{0.0};
+  double nearest_y{0.0};
   int count{0};
   bool near_base{false};
   bool near_outpost{false};
@@ -157,6 +159,8 @@ struct Thresholds
   double enemy_lost_time_s{5.0};
 
   double referee_stale_timeout_s{3.0};
+  double enemy_stale_timeout_s{1.0};
+  double supply_retry_cooldown_s{15.0};
   double engage_distance{3.0};
   double track_distance{8.0};
   double enhanced_defense_duration_s{15.0};

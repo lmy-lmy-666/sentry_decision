@@ -16,6 +16,8 @@ thresholds:
   resupply_timeout_s: 60.0
   retreat_timeout_s: 90.0
   enemy_lost_time_s: 5.0
+  enemy_stale_timeout_s: 1.0
+  supply_retry_cooldown_s: 15.0
   engage_distance: 3.0
   track_distance: 8.0
   enhanced_defense_duration_s: 15.0

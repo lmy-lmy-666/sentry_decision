@@ -101,6 +101,7 @@ struct Harness
       [this]() { nav_cancelled = true; })
   {
     ctx.set_thresholds(make_profile().thresholds);
+    ctx.set_now(0.0);
   }
 };
 
@@ -347,6 +348,179 @@ TEST(DecisionFsm, IdleWhenGameEnds)
   h.ctx.update(game(rm_interfaces::msg::GameStatus::GAME_OVER, 0));
   h.fsm.tick(h.ctx, 1.0);
   EXPECT_EQ(h.fsm.state(), State::IDLE);
+}
+
+// =========================================================================
+// 鲁棒性测试
+// =========================================================================
+
+TEST(DecisionFsm, AmmoZeroEnemyGoesResupply)
+{
+  // 没弹药时不管有没有敌人, 必须去补给
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 0));  // ammo=0
+  sentry_decision::EnemyInfo enemy;
+  enemy.detected = true;
+  enemy.nearest_distance = 3.0;
+  h.ctx.update(enemy);
+  h.fsm.tick(h.ctx, 0.0);
+  EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
+}
+
+TEST(DecisionFsm, AmmoZeroInResupplyEnemyDoesNotBreak)
+{
+  // 没弹药时在补给途中, 敌人出现不退出
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 0));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  sentry_decision::EnemyInfo enemy;
+  enemy.detected = true;
+  h.ctx.update(enemy);
+  h.fsm.tick(h.ctx, 1.0);
+  EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
+}
+
+TEST(DecisionFsm, NavStuckAdvancesPatrol)
+{
+  // 导航卡住 → 跳下一个巡逻点
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));  // 前哨站死 → PATROL
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::PATROL);
+  ASSERT_FALSE(h.goals.empty());
+  const auto first_goal = h.goals.back();
+  h.ctx.set_nav_status(sentry_decision::NavStatus::STUCK);
+  h.fsm.tick(h.ctx, 1.0);
+  h.ctx.set_nav_status(sentry_decision::NavStatus::MOVING);
+  h.fsm.tick(h.ctx, 2.0);
+  EXPECT_GE(h.goals.size(), 2u);
+  EXPECT_NE(h.goals.back().x, first_goal.x);
+}
+
+TEST(DecisionFsm, HpBoundaryNotEnterRetreat)
+{
+  // hp=60 刚好不触发 critical
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(60, 50));
+  h.ctx.update(outpost(500));
+  h.fsm.tick(h.ctx, 0.0);
+  EXPECT_NE(h.fsm.state(), State::RETREAT);
+}
+
+TEST(DecisionFsm, HpBoundaryEnterRetreat)
+{
+  // hp=59 触发 critical
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(59, 50));
+  h.fsm.tick(h.ctx, 0.0);
+  EXPECT_EQ(h.fsm.state(), State::RETREAT);
+}
+
+TEST(DecisionFsm, EnemyAppearsMidResupplyGoesDefend)
+{
+  // 有弹药时补给途中敌人出现 → 去战斗
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(140, 50));  // hp<150 触发 RESUPPLY
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  sentry_decision::EnemyInfo enemy;
+  enemy.detected = true;
+  h.ctx.update(enemy);
+  h.fsm.tick(h.ctx, 1.0);
+  EXPECT_EQ(h.fsm.state(), State::DEFEND);
+}
+
+TEST(DecisionFsm, EnemyGoneReturnsToResupply)
+{
+  // 战斗完敌人消失 → 血量还低 → 回 RESUPPLY
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(140, 50));
+  sentry_decision::EnemyInfo enemy;
+  enemy.detected = true;
+  enemy.nearest_distance = 2.0;
+  h.ctx.update(enemy);
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+  enemy.detected = false;
+  h.ctx.update(enemy);
+  h.ctx.set_now(1.0);
+  h.fsm.tick(h.ctx, 1.0);
+  EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
+}
+
+TEST(DecisionFsm, EngagesEnemyAtCloseRange)
+{
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  sentry_decision::EnemyInfo enemy;
+  enemy.detected = true;
+  enemy.nearest_distance = 1.5;  // <3m → ENGAGE
+  h.ctx.update(enemy);
+  h.fsm.tick(h.ctx, 0.0);
+  EXPECT_EQ(h.fsm.state(), State::DEFEND);
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::TRACK);
+  h.fsm.tick(h.ctx, 1.0);
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::ENGAGE);
+}
+
+TEST(DecisionFsm, RetreatSendSupplyNotRetreat)
+{
+  // RETREAT 发 supply 点, 不是 retreat 点
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(40, 50));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RETREAT);
+  ASSERT_FALSE(h.goals.empty());
+  EXPECT_DOUBLE_EQ(h.goals[0].x, -1.0);  // supply.x
+  EXPECT_DOUBLE_EQ(h.goals[0].y, -5.0);  // supply.y
+}
+
+TEST(DecisionFsm, ResupplyExitAtFullHp)
+{
+  // RESUPPLY 保持到满血
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(140, 50));  // hp<150
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  h.ctx.update(robot(399, 50));
+  h.fsm.tick(h.ctx, 1.0);
+  EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
+  h.ctx.update(robot(400, 50));
+  h.fsm.tick(h.ctx, 2.0);
+  EXPECT_NE(h.fsm.state(), State::RESUPPLY);
+}
+
+TEST(DecisionFsm, DefendExitWhenNoThreat)
+{
+  // 没有威胁 → 退出 DEFEND
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));  // 前哨站死 → PATROL
+  sentry_decision::EnemyInfo enemy;
+  enemy.detected = true;
+  enemy.nearest_distance = 2.0;
+  h.ctx.update(enemy);
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+  enemy.detected = false;
+  h.ctx.update(enemy);
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.fsm.tick(h.ctx, 5.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
 }
 
 int main(int argc, char ** argv)

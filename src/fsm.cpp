@@ -30,7 +30,7 @@ DecisionFsm::DecisionFsm(
 
 void DecisionFsm::tick(const Context & ctx, double now_s)
 {
-  const State candidate = select_state(ctx);
+  const State candidate = select_state(ctx, now_s);
   const State next = can_leave_current_state(candidate) ? candidate : state_;
 
   if (next != state_) {
@@ -43,7 +43,7 @@ void DecisionFsm::tick(const Context & ctx, double now_s)
   run_behaviour(ctx, now_s);
 }
 
-State DecisionFsm::select_state(const Context & ctx) const
+State DecisionFsm::select_state(const Context & ctx, double now_s) const
 {
   if (!ctx.referee_fresh() || !ctx.game_running()) {
     return State::IDLE;
@@ -60,18 +60,30 @@ State DecisionFsm::select_state(const Context & ctx) const
   }
 
   if (state_ == State::RESUPPLY) {
-    // 敌人出现时让路给 DEFEND（guard chain 优先级 ⑤）
-    if (!ctx.enemy_detected()) {
+    // 没弹药时不管有没有敌人都不退出补给（没法反击）
+    // 有弹药但 hp 低时，敌人出现才让路给 DEFEND
+    if (ctx.ammo_empty() || !ctx.enemy_detected()) {
       if (supply_backup_exhausted_) {
         if (ctx.hp() < profile_.thresholds.hp_critical_exit) {
           return State::RESUPPLY;
         }
-      } else if (ctx.ammo_empty() || ctx.hp() < profile_.thresholds.hp_low_exit_hysteresis) {
+      } else if (ctx.ammo_empty() || ctx.hp() < ctx.max_hp()) {
+        // 补给区不好走，到了就补满再出发
         return State::RESUPPLY;
       }
     }
-  } else if (ctx.needs_resupply() && !ctx.enemy_detected()) {
-    return State::RESUPPLY;
+  } else if (ctx.needs_resupply()) {
+    // supply_backup_exhausted_ 为 true 表示上一轮补给已耗尽所有
+    // 可选点仍未到达。此时除非弹药耗尽或冷却时间已过，否则不重试
+    // RESUPPLY，避免 PATROL↔RESUPPLY 死循环振荡。
+    bool supply_in_cooldown = supply_backup_exhausted_ && !ctx.ammo_empty() &&
+      (supply_fail_time_ > 0.0) &&
+      (now_s - supply_fail_time_ < profile_.thresholds.supply_retry_cooldown_s);
+    if (!supply_in_cooldown && (ctx.ammo_empty() || !ctx.enemy_detected())) {
+      // 没弹药时不管有没有敌人都去补给（没法打了）
+      // hp 低但弹药充足时，敌人在就先战斗
+      return State::RESUPPLY;
+    }
   }
 
   if (ctx.enemy_detected() || ctx.under_attack()) {
@@ -138,7 +150,7 @@ void DecisionFsm::on_enter(State s, double now_s)
     case State::RESUPPLY:
       switch_stance(StanceCommand::MOBILITY, now_s);
       operation_started_s_ = now_s;
-      supply_backup_exhausted_ = false;
+      // 不重置 supply_backup_exhausted_ — 防止补给失败后无限重试振荡
       break;
     case State::RETREAT:
       switch_stance(StanceCommand::DEFENSIVE, now_s);
@@ -306,8 +318,28 @@ void DecisionFsm::combat_track(const Context & ctx, double now_s)
     goal_sent_ = false;
     return;
   }
-  // TRACK 超时保护：20s 未进入 ENGAGE → 退回 SCOUT
-  if (now_s - substate_entered_s_ > 20.0) {
+
+  // 向最近敌人方向移动，缩短距离而非原地等待
+  if (ctx.nav_stuck()) {
+    goal_sent_ = false;
+  }
+  if (!goal_sent_) {
+    double dx = ctx.nearest_enemy_x() - ctx.sentry_x();
+    double dy = ctx.nearest_enemy_y() - ctx.sentry_y();
+    double dist = std::hypot(dx, dy);
+    if (dist > 0.1) {
+      // 追到交火距离 (engage_distance) 即可，不用贴脸
+      double target_dist = dist - profile_.thresholds.engage_distance;
+      if (target_dist < 0.0) target_dist = 0.0;
+      Waypoint pursue;
+      pursue.x = ctx.sentry_x() + dx / dist * target_dist;
+      pursue.y = ctx.sentry_y() + dy / dist * target_dist;
+      publish_single_goal(pursue);
+    }
+  }
+
+  // TRACK 超时保护：10s 未进入 ENGAGE → 退回 SCOUT（防止被钓鱼）
+  if (now_s - substate_entered_s_ > 10.0) {
     combat_substate_ = CombatSubState::SCOUT;
   }
 }
@@ -320,7 +352,9 @@ void DecisionFsm::combat_engage(const Context & ctx, double now_s)
     return;
   }
   if (ctx.enemy_distance() > profile_.thresholds.track_distance) {
-    combat_substate_ = CombatSubState::TRACK;
+    // 敌人跑远了追不上，直接回搜索
+    combat_substate_ = CombatSubState::SCOUT;
+    switch_stance(StanceCommand::DEFENSIVE, now_s);
     return;
   }
   if (ctx.under_attack() && now_s - last_hit_at_s_ < 0.5) {
@@ -340,11 +374,13 @@ void DecisionFsm::combat_engage(const Context & ctx, double now_s)
 
 void DecisionFsm::combat_evade(const Context & ctx, double now_s)
 {
-  if (!ctx.under_attack() && now_s - last_hit_at_s_ > 2.0) {
+  // 场地没有掩体可躲，最有效的闪避是立刻反击
+  switch_stance(StanceCommand::OFFENSIVE, now_s);
+
+  if (!ctx.under_attack() && now_s - last_hit_at_s_ > 1.0) {
+    // 1s 没再被打 → 回 SCOUT，自瞄会重新锁定继续打
     combat_substate_ = CombatSubState::SCOUT;
-    return;
   }
-  publish_single_goal(profile_.safe_cover);
 }
 
 void DecisionFsm::combat_harden(const Context & ctx, double now_s)
@@ -367,7 +403,8 @@ void DecisionFsm::combat_harden(const Context & ctx, double now_s)
 void DecisionFsm::combat_evade_air(const Context & ctx, double now_s)
 {
   switch_stance(StanceCommand::DEFENSIVE, now_s);
-  if (!goal_sent_ || ctx.nav_stuck()) publish_single_goal(profile_.safe_cover);
+  if (ctx.nav_stuck()) goal_sent_ = false;
+  if (!goal_sent_) publish_single_goal(profile_.safe_cover);
   if (!ctx.under_aerial_attack()) combat_substate_ = CombatSubState::SCOUT;
 }
 
@@ -384,11 +421,17 @@ void DecisionFsm::behave_attack_push(const Context & ctx, double now_s)
 
 void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
 {
+  // 到达补给区：重置失败标记，允许下次需要补给时重新尝试
+  if (ctx.on_supply_pad()) {
+    supply_backup_exhausted_ = false;
+    supply_fail_time_ = 0.0;
+    return;
+  }
+
   if (!goal_sent_) {
     publish_single_goal(profile_.supply);
     return;
   }
-  if (ctx.on_supply_pad()) return;
 
   if (now_s - operation_started_s_ > profile_.thresholds.resupply_timeout_s) {
     if (
@@ -399,13 +442,15 @@ void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
       return;
     }
     supply_backup_exhausted_ = true;
+    supply_fail_time_ = now_s;
   }
 }
 
 void DecisionFsm::behave_retreat(const Context & ctx, double now_s)
 {
   if (!goal_sent_) {
-    publish_single_goal(profile_.retreat);
+    // 直接撤到补给区，既能回血又能补弹，卡住再走备份链
+    publish_single_goal(profile_.supply);
     return;
   }
   if (ctx.hp() < ctx.max_hp() * 0.05) switch_stance(StanceCommand::ENHANCED_DEFENSIVE, now_s);

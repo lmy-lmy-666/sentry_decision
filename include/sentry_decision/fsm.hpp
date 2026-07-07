@@ -44,7 +44,7 @@ public:
   const Profile & profile() const { return profile_; }
 
 private:
-  State select_state(const Context & ctx) const;
+  State select_state(const Context & ctx, double now_s) const;
   bool can_leave_current_state(State next) const;
   bool attack_push_allowed(const Context & ctx) const;
   bool can_bypass_stance_cooldown(StanceCommand stance) const;
@@ -95,6 +95,7 @@ private:
   double substate_entered_s_{0.0};
   double operation_started_s_{0.0};
   bool supply_backup_exhausted_{false};
+  double supply_fail_time_{0.0};
 
   StanceCommand last_commanded_stance_{StanceCommand::NONE};
   double last_stance_command_s_{-1e9};
