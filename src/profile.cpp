@@ -121,6 +121,18 @@ Profile load_profile(const std::string & yaml_path)
       "decision profile '" + yaml_path + "' defines neither 'patrol' nor 'attack_push' waypoints");
   }
 
+  // safe_cover 默认 {0,0,0}——若未在 YAML 中显式配置，战斗子状态
+  // HARDEN/EVADE_AIR 会导航到地图原点，极其危险。
+  if (!root["safe_cover"]) {
+    throw std::runtime_error(
+      "decision profile '" + yaml_path + "' is missing required field 'safe_cover'");
+  }
+  if (p.safe_cover.x == 0.0 && p.safe_cover.y == 0.0) {
+    throw std::runtime_error(
+      "decision profile '" + yaml_path + "': 'safe_cover' is (0,0)—this is likely "
+      "an invalid fallback position and would send the sentry to the map origin");
+  }
+
   return p;
 }
 

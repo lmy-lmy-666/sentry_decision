@@ -96,6 +96,7 @@ private:
   double operation_started_s_{0.0};
   bool supply_backup_exhausted_{false};
   double supply_fail_time_{0.0};
+  int supply_pad_ticks_{0};  // RFID 防抖: 连续检测到补给区才确认到达
 
   StanceCommand last_commanded_stance_{StanceCommand::NONE};
   double last_stance_command_s_{-1e9};

@@ -1,6 +1,6 @@
 # sentry_decision — 决策系统能力说明
 
-> 最后更新: 2026-07-07 | 目标机器人: 哨兵 (Sentry) | 赛季: RM2026
+> 最后更新: 2026-07-08 | 目标机器人: 哨兵 (Sentry) | 赛季: RM2026
 
 ---
 
@@ -110,7 +110,7 @@ sentry_decision/
 ├── config/profiles/
 │   ├── rmuc_red.yaml / rmuc_blue.yaml / rmul.yaml
 ├── launch/sentry_decision_launch.py
-└── test/fsm_test.cpp              # 31 个 gtest 单元测试
+└── test/fsm_test.cpp              # 42 个 gtest 单元测试
 ```
 
 ### 6.1 types.hpp — 类型定义
@@ -134,7 +134,7 @@ sentry_decision/
 
 **裁判相关**: `game_running()`, `remain_time()`, `late_game()`, `referee_fresh()`, `hp()`, `hp_critical()`, `hp_low()`, `ammo()`, `ammo_empty()`, `barrel_heat()`, `overheat_risk()`, `needs_resupply()`, `under_attack()`, `attack_direction()`, `gold()`
 
-**感知相关**: `enemy_detected()`, `enemy_distance()`, `nearest_enemy_x()`, `nearest_enemy_y()`, `enemy_count()`, `under_aerial_attack()`, `double_vulnerability_active()`
+**感知相关**: `enemy_detected()`, `enemy_distance()`, `nearest_enemy_x()`, `nearest_enemy_y()`, `enemy_count()`, `under_aerial_attack()`
 
 **导航相关**: `nav_status()`, `nav_stuck()`, `goal_reached()`, `set_nav_status()`
 
@@ -160,7 +160,9 @@ sentry_decision/
 - **min_ticks_in_state**: 普通状态最小停留 4 tick（400ms），防止瞬态抖动
 - **stance 冷却**: 5s，DEFENSIVE/ENHANCED_DEFENSIVE 可绕过
 - **RESUPPLY 冷却**: 补给点全部失败后 15s 不重试（弹药空绕过），防止 PATROL↔RESUPPLY 死循环
-- **补给到达重置**: RFID 确认到达补给区后重置失败标记，允许下次正常补给
+- **补给到达防抖**: RFID 连续 3 tick 确认到达补给区，防止边缘信号抖动反复重置失败标记
+- **受击持久化**: `under_attack()` 维持 0.5s 滞后窗口防裁判标志瞬时清除
+- **子状态 goal 统一重置**: `run_combat_fsm` 检测到子状态变更时自动重置 `goal_sent_`
 
 ### 7.2 数据安全
 
@@ -168,13 +170,16 @@ sentry_decision/
 - **EnemyInfo 过期**: 1s 无新数据自动清除（可配 `enemy_stale_timeout_s`）
 - **motion_state 加固**: 词边界检查 + 连续 3 次 idle 才判 FAILED
 - **所有数据访问**: `std::optional` 保护，null 时返回安全默认值
-- **自瞄+雷达数据融合**: 自瞄做近距离检测（detected/distance），雷达提供全局坐标（nearest_x/y）。自瞄更新时保留雷达坐标不覆盖
+- **双源 OR 融合**: 自瞄+雷达独立维护检测标记和时间戳，读时 OR 融合，互不覆盖，任一方断连不丢敌情
+- **雷达测距同步**: 雷达回调同步更新 `nearest_distance`，纯雷达 TRACK→ENGAGE 距离判定可用
+- **线程安全**: 显式文档声明 SingleThreadedExecutor 依赖（`context.hpp` 类注释）
 
 ### 7.3 导航容错
 
 - **Nav2 action 可用**: 正常走 Action 协议（feedback/result 回调）
 - **Nav2 action 不可用**: 自动 fallback 到 PoseStamped topic + odom 距离到达检测
-- **导航卡住**: 跳下一个路点
+- **导航卡住**: 跳下一个路点（nav_stuck 即时响应 + drive_route 超时兜底）
+- **Stale goal 过滤**: result_callback + feedback_callback 均用 goal_id 比对，cancel_nav 始终 async_cancel_all_goals
 - **cancel_nav 清理**: Nav2 在线和离线模式均正确清理标志位
 - **空 route 保护**: `drive_route` 和 `publish_single_goal` 均有空检查和重复发送防护
 
@@ -182,15 +187,28 @@ sentry_decision/
 
 - **Waypoint 到达**: dwell 计时从到达后才开始，未到达不推进
 - **path_idx 回绕**: 到达路线末尾自动循环
-- **作战超时**: TRACK 10s / ENGAGE 30s → fallback SCOUT
-- **撤退多级兜底**: 主撤退点 → 备用撤退点链 → safe_cover → 原地不动
-- **补给多级兜底**: 主补给点 → 备用补给点链 → 冷却 → 重试
+- **作战超时**: TRACK 10s / ENGAGE 30s / HARDEN 15s → 阶梯降级
+- **撤退多级兜底**: retreat → backup_retreat_points → supply → safe_cover (四级)
+- **补给多级兜底**: supply → backup_supply_points[N] → 冷却 → 重试
+- **空路由保护**: PATROL 空路由设 goal_sent_=true 防空转
+- **TRACK 无 odom 保护**: odom 未就绪时沿 defend_fallback 移动
+- **safe_cover 校验**: profile 加载时缺失或 (0,0) 抛异常
 
 ---
 
 ## 8. 修改日志
 
-### 2026-07-07 稳定性修复（本轮）
+### 2026-07-08 三轮全面代码审查（共 15 个问题, 17 处改动）
+
+| 轮次 | 修复数 | 关键项 |
+|------|--------|--------|
+| R1 | 7 | P1 stale goal 竞态, P3 safe_cover 校验, P5 解析 DoS, P6 robot_type 日志, P8 TRACK 无 odom 空转, P10 RESUPPLY nav_stuck, P13 PATROL 空路由 |
+| R2 | 4 | N1 cancel_nav 全取消, N2 子状态 goal 统一重置, N3 雷达距离同步, N4 feedback goal_id 比较 |
+| R3 | 5 | P2 late_game_trailing 接入, P4 线程安全文档, P7 under_attack 0.5s 持久化, P9 RFID 3-tick 防抖, 冗余代码清理 |
+
+测试: 42/42 全部通过，零编译警告。
+
+### 2026-07-07 稳定性修复
 
 #### 8.1 RESUPPLY 防死循环振荡
 `on_enter(RESUPPLY)` 不再重置 `supply_backup_exhausted_`。新增 15s 冷却期（`supply_retry_cooldown_s`），补给全部失败后有弹药时冷却期内不重试。到达补给区（RFID 确认）后重置。弹药耗尽时绕过冷却。
@@ -281,10 +299,9 @@ Nav2 不可用时 `cancel_nav()` 也正确清理 `nav_goals_active_` 和 `fallba
 | 9.3 | 0x020C 空中威胁来源未接入 | 可选 |
 | 9.4 | Profile 坐标未确认 | 待实车地图 |
 | 9.5 | 自瞄结构化 Target 开关未开 | 待自瞄同学 |
-| 9.6 | 多敌人决策退化 | 低优先级 |
-| 9.7 | 己方队友协同 | 远期规划 |
-| 9.8 | 热管理优化 | 远期规划 |
-| 9.9 | RFID 增益点策略 | 远期规划 |
+| 9.6 | `stance_expiring()` stub | 依赖 0x020D |
+| 9.7 | 多敌人决策退化 | 低优先级 |
+| 9.8 | 己方队友协同 | 远期规划 |
 
 ---
 
@@ -367,15 +384,11 @@ ros2 run sentry_decision sentry_decision_node --ros-args \
 
 以下问题代码静态审查无法发现，需要在仿真或实车环境下闭环测试才能暴露。
 
-### 13.1 数据竞态：自瞄与雷达到达顺序不确定
+### 13.1 数据竞态：已修复 — 双源读时融合
 
-**问题**: `auto_aim_target_callback` 和 `radar_callback` 各自创建完整 `EnemyInfo` 后调用 `context_.update()` 全量替换。虽然已保护自瞄不覆盖雷达坐标，但两个源到达顺序不确定时，`detected` / `count` / `nearest_distance` 等字段会被最后一个到达的来源覆盖。
+**已修复 (2026-07-08)**: `context.hpp` 重构为读时融合架构。`aim_detected_` / `radar_has_target_` 独立标记 + 独立时间戳，`update_enemy_from_aim()` / `update_enemy_from_radar()` 各自只写自己负责的字段。`enemy_detected()` 读时 OR 融合。彻底消除源间覆盖竞态。雷达 `min_dist` 通过 N3 修复同步更新 `nearest_distance`。
 
-**风险**: 雷达报告 3 个敌人，自瞄只报告 1 个近距离目标。如果自瞄在雷达之后到达，`count` 从 3 变成 1，`nearest_distance` 从雷达的全局距离变成自瞄的云台相对距离。F SM 可能丢失多敌人感知。
-
-**验证方式**: 仿真中同时运行雷达和自瞄，观察 `sentry/command` 输出和 FSM 状态日志，确认 EnemyInfo 不会在两个源之间抖动。
-
-**修复方向**: 两个回调不各自创建完整 EnemyInfo，改为更新各自负责的字段子集。Context 提供增量更新接口。
+**验证方式**: 仿真中同时运行雷达和自瞄，观察 FSM 状态日志，确认双源数据不互相覆盖。
 
 ### 13.2 TRACK 追击在真实雷达数据下的流畅性
 
@@ -417,15 +430,11 @@ ros2 run sentry_decision sentry_decision_node --ros-args \
 
 **修复方向**: 检测到 action server 状态从 down→up 时主动 `async_cancel_all_goals` 清理服务端状态。
 
-### 13.6 补给区 RFID 触发延迟
+### 13.6 补给区 RFID 确认（已加防抖）
 
-**问题**: `behave_resupply` 中 `ctx.on_supply_pad()` 依赖 RFID 检测。RFID 是物理感应，可能有 0.5-1 秒延迟。在这段延迟期间，机器人已到达补给区坐标但未被识别为"已到达"。
+**已修复 (2026-07-08, P9)**: `behave_resupply` 增加 RFID 3-tick 防抖机制：连续 3 个 tick (0.3s) 检测到 `on_supply_pad()` 为 true 才确认到达。防抖期间暂停导航防止 overshoot。信号消失时计数器立即清零。防止 RFID 边缘信号抖动反复重置 `supply_backup_exhausted_` 标记。
 
-**风险**: 如果 `resupply_timeout_s` 设置得太短，机器人到达补给区后 RFID 还没触发就被判超时，切到备用补给点。但如果机器人确实没到达（导航误差），适当超时又是必要的。
-
-**验证方式**: 实车测试中在补给区放置 RFID 卡，测量从 goal 到达（Nav2 succeeded）到 RFID 触发（on_supply_pad 变 true）的延迟。调整 `resupply_timeout_s` 使其至少为此延迟的 2 倍。
-
-**修复方向**: 结合 goal 到达（odom 距离）+ RFID 双重确认，而非仅依赖 RFID。
+**验证方式**: 实车测试中在补给区放置 RFID 卡，验证到达后 `supply_backup_exhausted_` 被正确重置，且边缘信号不会误触发。
 
 ### 13.7 无 motion_state 数据时的行为退化
 
@@ -474,3 +483,4 @@ omni_navigation 无独立 `motion_manager` 节点。决策通过 Nav2 action fee
 
 - 裁判数据：外部学校 bag → PATROL→RESUPPLY→RETREAT→IDLE ✅
 - 单元测试：42/42 ✅
+- 三轮代码审查：15 个问题修复 ✅

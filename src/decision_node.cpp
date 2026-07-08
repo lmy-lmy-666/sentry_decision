@@ -198,11 +198,10 @@ void DecisionNode::cancel_nav()
     context_.set_nav_status(NavStatus::IDLE);
     return;
   }
-  if (current_goal_handle_) {
-    (void)nav_action_client_->async_cancel_goal(current_goal_handle_);
-  } else {
-    (void)nav_action_client_->async_cancel_all_goals();
-  }
+  // 始终取消所有 goal：current_goal_handle_ 可能指向旧 goal，
+  // 而新 goal 已在 route 推进时发送但 goal_response 尚未更新 handle。
+  (void)nav_action_client_->async_cancel_all_goals();
+  current_goal_handle_.reset();
   nav_goals_active_ = false;
   context_.set_nav_status(NavStatus::IDLE);
   RCLCPP_INFO(get_logger(), "cancelled all Nav2 goals");
@@ -224,7 +223,8 @@ void DecisionNode::feedback_callback(
   GoalHandleNavigateToPose::SharedPtr goal_handle,
   const std::shared_ptr<const NavigateToPose::Feedback> feedback)
 {
-  if (current_goal_handle_ && goal_handle != current_goal_handle_) {
+  // 用 goal_id 比较而非 shared_ptr 地址比较，与 result_callback 保持一致
+  if (current_goal_handle_ && goal_handle->get_goal_id() != current_goal_handle_->get_goal_id()) {
     return;
   }
   if (feedback->distance_remaining <= goal_reached_distance_tolerance_) {
@@ -236,6 +236,12 @@ void DecisionNode::feedback_callback(
 
 void DecisionNode::result_callback(const GoalHandleNavigateToPose::WrappedResult & result)
 {
+  // 过滤旧 goal 的延迟回调：若当前活跃 goal handle 与回调 goal_id 不一致，
+  // 说明新 goal 已发送，忽略此 stale 结果以防覆盖 nav_status。
+  if (current_goal_handle_ && result.goal_id != current_goal_handle_->get_goal_id()) {
+    RCLCPP_DEBUG(get_logger(), "ignoring stale Nav2 result for a superseded goal");
+    return;
+  }
   current_goal_handle_.reset();
   // nav_goals_active_ 由 publish_goal 重设，不在此无条件清零——防止旧 goal
   // 的结果回调覆盖新 goal 的活跃标志（route 推进时可能连续发 goal）
@@ -313,6 +319,8 @@ bool DecisionNode::parse_auto_aim_target(const std::string & text, bool & detect
     } catch (const std::exception &) {
       return false;
     }
+    // 提前拒绝超长恶意输入，防 DoS（期望恰好 4 个字段）
+    if (values.size() > 4) return false;
 
     if (comma == std::string::npos) {
       break;
@@ -336,7 +344,13 @@ bool DecisionNode::parse_auto_aim_target(const std::string & text, bool & detect
 
 void DecisionNode::radar_callback(const radar_msgs::msg::EnemyPosition::SharedPtr msg)
 {
-  if (msg->robot_type >= radar_positions_.size()) return;
+  if (msg->robot_type >= radar_positions_.size()) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "radar robot_type %u out of range [0,%zu), dropping", msg->robot_type,
+      radar_positions_.size());
+    return;
+  }
   auto & slot = radar_positions_[msg->robot_type];
   slot.x = msg->x;
   slot.y = msg->y;
@@ -364,7 +378,7 @@ void DecisionNode::radar_callback(const radar_msgs::msg::EnemyPosition::SharedPt
     count++;
   }
   bool aerial = radar_positions_[4].valid;  // TYPE_AERIAL
-  context_.update_enemy_from_radar(nearest_x, nearest_y, count, aerial);
+  context_.update_enemy_from_radar(nearest_x, nearest_y, count, aerial, min_dist);
 }
 
 

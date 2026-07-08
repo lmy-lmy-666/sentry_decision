@@ -27,6 +27,10 @@
 namespace sentry_decision
 {
 
+/// Sensor-fused world model consumed by DecisionFsm::tick().
+/// Thread safety: all reads/writes must be serialized externally — this class
+/// contains no internal locking and assumes a SingleThreadedExecutor or
+/// equivalent guarantee that callbacks and the tick timer share one thread.
 class Context
 {
 public:
@@ -44,6 +48,13 @@ public:
   {
     robot_status_ = m;
     robot_status_stamp_ = now();
+    // 缓存受击时刻：裁判可能在下一帧清除 is_hp_deduced，
+    // 但 under_attack() 需要短窗口持久化防止漏检。
+    if (m.is_hp_deduced &&
+        (m.hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_HIT ||
+         m.hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_COLLISION)) {
+      last_under_attack_s_ = now();
+    }
   }
   void update(const rm_interfaces::msg::RfidStatus & m)
   {
@@ -65,7 +76,7 @@ public:
     enemy_info_->nearest_distance = detected ? distance : 999.0;
     aim_stamp_ = now();
   }
-  void update_enemy_from_radar(double x, double y, int count, bool aerial)
+  void update_enemy_from_radar(double x, double y, int count, bool aerial, double min_dist = 999.0)
   {
     if (!enemy_info_) enemy_info_ = EnemyInfo{};
     radar_has_target_ = (count > 0);
@@ -73,6 +84,8 @@ public:
     enemy_info_->nearest_y = y;
     enemy_info_->count = count;
     enemy_info_->aerial_threat = aerial;
+    // 雷达测距（仅在己方 odom 就绪时有效，否则保持自瞄值或默认值）
+    if (min_dist < 999.0) enemy_info_->nearest_distance = min_dist;
     radar_stamp_ = now();
   }
 
@@ -151,12 +164,16 @@ public:
 
   bool on_base_gain_point() const { return rfid_fresh() && rfid_status_->base_gain_point; }
 
-  // 装甲中弹 或 被撞击——都是敌方造成的伤害
+  // 装甲中弹 或 被撞击——都是敌方造成的伤害。
+  // 裁判可能在上报后清除标志，因此额外维持 0.5s 短窗口防止 tick 错开漏检。
   bool under_attack() const
   {
-    return robot_status_ && robot_status_->is_hp_deduced &&
-           (robot_status_->hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_HIT ||
-            robot_status_->hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_COLLISION);
+    if (robot_status_ && robot_status_->is_hp_deduced &&
+        (robot_status_->hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_HIT ||
+         robot_status_->hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_COLLISION)) {
+      return true;
+    }
+    return (now() - last_under_attack_s_) < 0.5;
   }
 
   uint8_t hit_armor_id() const { return robot_status_ ? robot_status_->armor_id : 0; }
@@ -254,6 +271,7 @@ private:
   double robot_status_stamp_{0.0};
   double rfid_stamp_{0.0};
   double robot_hp_stamp_{0.0};
+  mutable double last_under_attack_s_{-1.0};  // 受击持久化: under_attack() 的 0.5s 滞后窗
   NavStatus nav_status_{NavStatus::IDLE};
   double sentry_x_{0.0};
   double sentry_y_{0.0};

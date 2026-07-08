@@ -1,20 +1,25 @@
 # sentry_decision — 哨兵导航决策模块
 
-> Sentry26 导航系统核心决策层 | 基于 C++17 FSM | RM2026 赛季
+> omni_navigation 工作空间核心决策层 | 基于 C++17 FSM | RM2026 赛季
 
 ---
 
-## 一、在 Sentry26 中的位置
+## 一、在 omni_navigation 工作空间中的位置
 
 ```text
-Sentry26 导航系统
-├── rm_serial_driver        ← 串口通信（裁判系统 ↔ STM32）
-├── sentry_motion_manager   ← 运动仲裁（Nav2 → cmd_vel）
-├── sentry_decision         ← 战术决策（本模块）
+omni_navigation 工作空间
+├── serial/serial_driver     ← 串口通信（裁判系统 ↔ STM32）
+├── rm_interfaces            ← 自定义 ROS2 消息/服务
+├── radar_msgs               ← 雷达消息定义
+├── sentry_decision          ← 战术决策（本模块）
 │   ├── 订阅裁判/自瞄/雷达/运动状态
 │   ├── FSM 决定当前状态（IDLE/PATROL/DEFEND/ATTACK_PUSH/RESUPPLY/RETREAT）
 │   └── 输出 Nav2 goal + 姿态指令（sentry/command）
-└── Nav2                     ← 路径规划 + 控制
+├── sentry_nav               ← 路径规划 + 控制（Nav2 插件 + omni_pid_pursuit_controller + odom_bridge）
+├── sentry_behavior          ← 行为树（上层编排）
+├── sentry_robot_description ← 机器人 URDF 模型
+├── sentry_tools             ← 调试/工具
+└── simulator                ← 仿真
 ```
 
 决策是导航系统的大脑：**根据比赛态势决定哨兵往哪走、用什么姿态。**
@@ -28,7 +33,7 @@ Sentry26 导航系统
 | 裁判系统（血量/弹药/热量/时间段） | serial_driver | ROS2 topic `/referee/*` |
 | 自瞄目标（近距离） | bof_26_vision | ROS2 topic `auto_aim_target_pos` |
 | 雷达敌方坐标（全局） | RM2026_BOF_Radar | ROS2 topic `/radar/enemy_positions` |
-| 运动状态 | sentry_motion_manager | topic `motion_manager/state` + `motion_manager/motion_state` |
+| 运动状态 | sentry_nav / Nav2 action feedback | topic `motion_manager/state` + `motion_manager/motion_state`（omni 通过 Nav2 feedback 判断到达，不依赖独立 motion_manager） |
 | 里程计 | Nav2/定位 | ROS2 topic `/odometry` |
 
 ---
@@ -92,7 +97,7 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 - **stance 冷却**：5s 间隔 + 去重检测
 - **数据 stale 保护**：裁判 3s / 敌人 1s 无数据自动安全兜底
 - **导航容错**：Nav2 宕机自动 fallback，卡住跳点，cancel 完整清理
-- **自瞄+雷达融合**：自瞄管检测，雷达管坐标，各不覆盖
+- **自瞄+雷达双源读时融合**：各源独立维护检测标记和时间戳，读时 OR 融合，互不覆盖，任一方断连不丢敌情
 - **所有数据访问**：`std::optional` 保护，null 返回安全默认值
 
 ---
@@ -123,8 +128,9 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 ## 七、与自瞄的关系
 
 - 自瞄通过 `auto_aim_target_pos`（`std_msgs/String: "x,y,valid,id"`）提供近距离检测
-- 决策端解析字符串获取 `detected` 和 `nearest_distance`
-- 自瞄坐标信息不覆盖雷达的全局坐标（数据融合保护）
+- 决策端解析字符串后调用 `context_.update_enemy_from_aim(detected, distance)`，写入自瞄独立标记 `aim_detected_`，不触碰雷达数据
+- 雷达通过 `context_.update_enemy_from_radar()` 写入独立标记 `radar_has_target_`
+- 读时 OR 融合：`enemy_detected()` 任一源有效即为 true，自瞄丢锁不丢失雷达坐标，雷达断连不丢失自瞄检测
 - 结构化 `Target` 消息接口已预留，自瞄端开关未打开
 
 ---
@@ -140,7 +146,7 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 - 自瞄不覆盖雷达坐标
 - 导航卡住时 goal 清理（combat_track / combat_evade_air）
 
-### 2026-07-08 代码审查修复（本轮）
+### 2026-07-08 代码审查修复（上一轮）
 
 - 雷达回调增加 odom 就绪检查：odom 未就绪时使用首个有效目标坐标，不再从原点错误计算距离
 - TRACK 追击目标周期性更新：每 1s 重算追击点，跟踪移动敌人（修复追旧坐标问题）
@@ -150,6 +156,21 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 - ENGAGE 增加距离判断：敌人退到 `engage_distance * 1.5` 外 + 停留 ≥2s 时回 TRACK 缩近距离
 - `on_exit(DEFEND)` 清理 `enemy_lost_at_s_` 和 `last_hit_at_s_`，消除维护隐患
 - 测试从 30 个增加到 42 个，覆盖所有修复场景
+
+### 2026-07-08 双源融合重构
+
+- **自瞄+雷达读时融合**：`context.hpp` 重构，`aim_detected_` / `radar_has_target_` 独立标记 + 独立时间戳，`update_enemy_from_aim()` / `update_enemy_from_radar()` 各自写自己的，读时 OR 融合，彻底消除源间覆盖竞态
+- **decision_node.cpp 大幅简化**（-138 行）：回调逻辑收拢到 context，只调融合接口
+- 雷达 hypot 参考系修复、最近敌人 min_dist 追踪修复、HARDEN→SCOUT/EVADE 等 bug 修复
+- 串口 stance 下行：`protocol.yaml` reserved→stance
+
+### 2026-07-08 三轮全面代码审查与修复 (15 issues, 17 changes)
+
+**Round 1 (7 fixes)**: stale goal result 竞态, safe_cover 校验, 解析 DoS, robot_type 日志, TRACK 无 odom 空转, RESUPPLY nav_stuck 快速响应, PATROL 空路由保护
+
+**Round 2 (4 fixes)**: cancel_nav 始终全取消, 子状态切换 goal_sent_ 统一重置, 雷达测距同步 nearest_distance, feedback_callback goal_id 比较
+
+**Round 3 (5 fixes)**: late_game_trailing 接入(ally_base_hp 启发式), 线程安全文档, under_attack() 0.5s 持久化窗口, RFID 3-tick 防抖, 冗余代码清理
 
 ### 历史改进
 - 基础稳定性（now()、RFID、空 route、hysteresis、姿态冷却去重）
@@ -170,6 +191,8 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 | 0x020C 未接入（可选） | 空中威胁、双倍易伤无来源 | 电控 + serial_driver |
 | Profile 坐标未填 | 补给点、撤退点、巡逻路线为空 | 实车地图确认后填入 |
 | `io::ROS2 ros2;` 未传 true | sentry.yaml 已配但代码未读 config → 自瞄结构化消息开关未生效 | 自瞄同学 |
+| `stance_expiring()` stub | SentryInfo 下行未就绪，始终返回 false | 电控 + serial_driver |
+| 多敌人决策退化 | 当前仅追踪最近敌人 | 远期规划 |
 
 ---
 
@@ -238,12 +261,7 @@ ros2 run sentry_decision sentry_decision_node --ros-args \
 | `motion_manager/state` | omni 无独立 motion_manager。决策通过 Nav2 action feedback 判断到达，不依赖此话题 |
 | `motion_manager/motion_state` | 同上 |
 
-```text
-GTest: 42/42
-编译: 全部通过
-```
-
-## 十二、更多文档
+## 十三、更多文档
 
 | 文档 | 内容 |
 |------|------|
@@ -251,5 +269,8 @@ GTest: 42/42
 | `docs/interface_audit.md` | 接口审计与接入方向 |
 | `docs/profile_coordinates.md` | Profile 坐标填写说明 |
 | `docs/测试指南.md` | 测试说明 |
+| `docs/决策功能说明.md` | 决策功能详细说明 |
+| `docs/决策状态机树状图.md` | 完整 FSM 状态迁移图 |
 | `docs/changes/` | 历次修改日志 |
+| `docs/changes/2026-07-08_sensor_fusion.md` | 双源融合重构详细设计 |
 | `docs/剩余待完成事项.md` | 待完成事项清单 |

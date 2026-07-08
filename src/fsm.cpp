@@ -134,8 +134,13 @@ bool DecisionFsm::attack_push_allowed(const Context & ctx) const
   if (ctx.hp() < profile_.thresholds.hp_low_exit_hysteresis) return false;
   if (ctx.under_attack()) return false;
 
-  // 比赛后期默认使用保守策略（late_game_leading），暂不支持自动检测领先/落后
-  if (ctx.late_game() && profile_.late_game_leading.disable_attack_push) return false;
+  // 比赛后期: 根据盟友基地是否存活判断领先/落后，选择对应策略。
+  // 基地存活 → 领先（保守），基地被破 → 落后（激进）。
+  if (ctx.late_game()) {
+    const auto & lg = ctx.ally_base_hp() > 0 ? profile_.late_game_leading
+                                             : profile_.late_game_trailing;
+    if (lg.disable_attack_push) return false;
+  }
 
   return true;
 }
@@ -222,12 +227,23 @@ void DecisionFsm::behave_idle(const Context &, double) {}
 
 void DecisionFsm::behave_patrol(const Context & ctx, double now_s)
 {
-  const auto & route = (ctx.late_game() && !profile_.late_game_leading.fallback_patrol.empty())
-                         ? profile_.late_game_leading.fallback_patrol
-                         : profile_.patrol;
+  // 比赛后期: 根据盟友基地存活判断领先/落后，选择对应巡逻路线。
+  const Route * late_route = nullptr;
+  if (ctx.late_game()) {
+    const auto & lg = ctx.ally_base_hp() > 0 ? profile_.late_game_leading
+                                             : profile_.late_game_trailing;
+    if (!lg.fallback_patrol.empty()) late_route = &lg.fallback_patrol;
+  }
+  const auto & route = late_route ? *late_route : profile_.patrol;
+
+  // 空路由保护：无路点可走时标记 goal_sent_ 防止每 tick 空转 drive_route
+  if (route.empty()) {
+    goal_sent_ = true;
+    return;
+  }
 
   if (ctx.nav_stuck()) {
-    if (!route.empty()) path_idx_ = (path_idx_ + 1) % route.size();
+    path_idx_ = (path_idx_ + 1) % route.size();
     goal_sent_ = false;
     return;
   }
@@ -283,6 +299,7 @@ void DecisionFsm::run_combat_fsm(const Context & ctx, double now_s)
 
   if (combat_substate_ != prev_sub) {
     substate_entered_s_ = now_s;
+    goal_sent_ = false;  // 子状态切换 = 旧导航目标作废，新子状态重新发布 goal
   }
 }
 
@@ -292,14 +309,12 @@ void DecisionFsm::combat_scout(const Context & ctx, double now_s)
   if (ctx.enemy_detected() && now_s - substate_entered_s_ > 0.2) {
     combat_substate_ = CombatSubState::TRACK;
     switch_stance(StanceCommand::DEFENSIVE, now_s);
-    goal_sent_ = false;
     return;
   }
 
   if (ctx.under_attack()) {
     combat_substate_ = CombatSubState::EVADE;
     switch_stance(StanceCommand::DEFENSIVE, now_s);
-    goal_sent_ = false;
     return;
   }
 
@@ -328,12 +343,11 @@ void DecisionFsm::combat_track(const Context & ctx, double now_s)
   if (ctx.under_attack() && now_s - last_hit_at_s_ < 0.5) {
     combat_substate_ = CombatSubState::EVADE;
     switch_stance(StanceCommand::DEFENSIVE, now_s);
-    goal_sent_ = false;
     return;
   }
 
   // 向最近敌人方向移动，缩短距离而非原地等待
-  // 需要己方位置已知才计算追击目标（odom 未就绪时跳过）
+  // 需要己方位置已知才计算追击目标
   if (ctx.nav_stuck()) {
     goal_sent_ = false;
   }
@@ -350,6 +364,17 @@ void DecisionFsm::combat_track(const Context & ctx, double now_s)
       pursue.y = ctx.sentry_y() + dy / dist * target_dist;
       publish_single_goal(pursue, now_s);
       last_pursuit_update_s_ = now_s;
+    }
+  }
+
+  // odom 未就绪时无法计算追击向量，退而沿 defend_fallback 移动，避免原地空转
+  if (!goal_sent_ && !ctx.sentry_pos_valid()) {
+    if (!profile_.defend_fallback.empty()) {
+      if (ctx.nav_stuck()) {
+        path_idx_ = (path_idx_ + 1) % profile_.defend_fallback.size();
+        goal_sent_ = false;
+      }
+      drive_route(profile_.defend_fallback, now_s);
     }
   }
 
@@ -397,13 +422,11 @@ void DecisionFsm::combat_engage(const Context & ctx, double now_s)
     now_s - substate_entered_s_ > 2.0) {
     combat_substate_ = CombatSubState::TRACK;
     switch_stance(StanceCommand::DEFENSIVE, now_s);
-    goal_sent_ = false;
     return;
   }
   if (ctx.under_attack() && now_s - last_hit_at_s_ < 0.5) {
     combat_substate_ = CombatSubState::EVADE;
     switch_stance(StanceCommand::DEFENSIVE, now_s);
-    goal_sent_ = false;
     return;
   }
   if (ctx.overheat_risk()) switch_stance(StanceCommand::DEFENSIVE, now_s);
@@ -442,7 +465,6 @@ void DecisionFsm::combat_harden(const Context & ctx, double now_s)
   }
   if (!ctx.under_aerial_attack()) {
     combat_substate_ = CombatSubState::SCOUT;
-    goal_sent_ = false;
   }
 }
 
@@ -466,10 +488,23 @@ void DecisionFsm::behave_attack_push(const Context & ctx, double now_s)
 
 void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
 {
-  // 到达补给区：重置失败标记，允许下次需要补给时重新尝试
+  // 到达补给区（RFID 防抖: 连续 3 ticks 确认，避免边缘信号抖动反复重置状态）
   if (ctx.on_supply_pad()) {
-    supply_backup_exhausted_ = false;
-    supply_fail_time_ = 0.0;
+    if (++supply_pad_ticks_ >= 3) {
+      supply_backup_exhausted_ = false;
+      supply_fail_time_ = 0.0;
+      return;
+    }
+    return;  // 防抖期间暂停导航，防止 overshoot
+  }
+  supply_pad_ticks_ = 0;
+
+  // 导航卡住时立即尝试备用补给点，不等完整 timeout
+  if (ctx.nav_stuck() && !profile_.backup_supply_points.empty() &&
+      path_idx_ < profile_.backup_supply_points.size()) {
+    goal_sent_ = false;
+    publish_single_goal(profile_.backup_supply_points[path_idx_++], now_s);
+    operation_started_s_ = now_s;
     return;
   }
 
