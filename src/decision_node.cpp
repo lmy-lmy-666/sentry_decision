@@ -30,8 +30,6 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
   const std::string profile_path = this->declare_parameter<std::string>("profile_path", "");
   const double tick_hz = this->declare_parameter<double>("tick_frequency", 10.0);
   const std::string goal_topic = this->declare_parameter<std::string>("goal_topic", "/goal_pose");
-  const std::string motion_state_topic =
-    this->declare_parameter<std::string>("motion_state_topic", "motion_manager/state");
   const std::string auto_aim_target_topic =
     this->declare_parameter<std::string>("auto_aim_target_topic", "auto_aim_target_pos");
   nav_action_name_ = this->declare_parameter<std::string>("nav_action_name", "navigate_to_pose");
@@ -65,17 +63,11 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
     "referee/robot_status", 10,
     [this](const rm_interfaces::msg::RobotStatus::SharedPtr m) { context_.update(*m); });
   sub_rfid_status_ = create_subscription<rm_interfaces::msg::RfidStatus>(
-    "referee/rfid_status", 10,
+    "referee/rfidStatus", 10,
     [this](const rm_interfaces::msg::RfidStatus::SharedPtr m) { context_.update(*m); });
   sub_robot_hp_ = create_subscription<rm_interfaces::msg::GameRobotHP>(
     "referee/all_robot_hp", 10,
     [this](const rm_interfaces::msg::GameRobotHP::SharedPtr m) { context_.update(*m); });
-  sub_motion_state_ = create_subscription<std_msgs::msg::String>(
-    motion_state_topic, 10,
-    std::bind(&DecisionNode::motion_state_callback, this, std::placeholders::_1));
-  sub_motion_state_structured_ = create_subscription<rm_interfaces::msg::MotionState>(
-    "motion_manager/motion_state", 10,
-    std::bind(&DecisionNode::motion_state_structured_callback, this, std::placeholders::_1));
   sub_auto_aim_target_ = create_subscription<std_msgs::msg::String>(
     auto_aim_target_topic, 10,
     std::bind(&DecisionNode::auto_aim_target_callback, this, std::placeholders::_1));
@@ -135,6 +127,9 @@ void DecisionNode::on_tick()
 
 void DecisionNode::publish_goal(const Waypoint & wp)
 {
+  // 新 goal 到来时清掉旧的 fallback 坐标，防止 on_tick 误判到达
+  fallback_goal_active_ = false;
+
   NavigateToPose::Goal goal_msg;
   goal_msg.pose.header.stamp = this->now();
   goal_msg.pose.header.frame_id = goal_frame_;
@@ -242,19 +237,23 @@ void DecisionNode::feedback_callback(
 void DecisionNode::result_callback(const GoalHandleNavigateToPose::WrappedResult & result)
 {
   current_goal_handle_.reset();
-  nav_goals_active_ = false;
+  // nav_goals_active_ 由 publish_goal 重设，不在此无条件清零——防止旧 goal
+  // 的结果回调覆盖新 goal 的活跃标志（route 推进时可能连续发 goal）
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
       context_.set_nav_status(NavStatus::ARRIVED);
       break;
     case rclcpp_action::ResultCode::CANCELED:
       context_.set_nav_status(NavStatus::IDLE);
+      nav_goals_active_ = false;
       break;
     case rclcpp_action::ResultCode::ABORTED:
       context_.set_nav_status(NavStatus::FAILED);
+      nav_goals_active_ = false;
       break;
     case rclcpp_action::ResultCode::UNKNOWN:
       context_.set_nav_status(NavStatus::FAILED);
+      nav_goals_active_ = false;
       break;
   }
 }
@@ -279,84 +278,23 @@ void DecisionNode::send_stance_command(StanceCommand stance)
     idx < 7 ? stance_names[idx] : "INVALID", idx);
 }
 
-void DecisionNode::motion_state_structured_callback(
-  const rm_interfaces::msg::MotionState::SharedPtr msg)
-{
-  if (msg->emergency_stop) {
-    context_.set_nav_status(NavStatus::FAILED);
-    idle_detection_counter_ = 0;
-    return;
-  }
-  if (
-    msg->recovery_phase == rm_interfaces::msg::MotionState::PHASE_STRAIGHT_RELEASE ||
-    msg->recovery_phase == rm_interfaces::msg::MotionState::PHASE_LOW_CURVATURE_RELEASE ||
-    msg->recovery_phase == rm_interfaces::msg::MotionState::PHASE_ARC_ESCAPE) {
-    context_.set_nav_status(NavStatus::STUCK);
-    idle_detection_counter_ = 0;
-    return;
-  }
-  if (msg->mode == rm_interfaces::msg::MotionState::MODE_NAVIGATION && msg->has_fresh_command) {
-    context_.set_nav_status(NavStatus::MOVING);
-    idle_detection_counter_ = 0;
-    return;
-  }
-  if (msg->mode == rm_interfaces::msg::MotionState::MODE_IDLE && nav_goals_active_) {
-    idle_detection_counter_++;
-    if (idle_detection_counter_ >= 3) {
-      context_.set_nav_status(NavStatus::FAILED);
-    }
-  } else {
-    idle_detection_counter_ = 0;
-  }
-}
 
-void DecisionNode::motion_state_callback(const std_msgs::msg::String::SharedPtr msg)
-{
-  const std::string & s = msg->data;
-  if (contains_token(s, "emergency_stop=true")) {
-    context_.set_nav_status(NavStatus::FAILED);
-    idle_detection_counter_ = 0;
-    return;
-  }
-  if (
-    contains_token(s, "recovery_phase=straight_release") ||
-    contains_token(s, "recovery_phase=low_curvature_release") ||
-    contains_token(s, "recovery_phase=arc_escape")) {
-    context_.set_nav_status(NavStatus::STUCK);
-    idle_detection_counter_ = 0;
-    return;
-  }
-  if (contains_token(s, "mode=navigation") && contains_token(s, "has_fresh_command=true")) {
-    context_.set_nav_status(NavStatus::MOVING);
-    idle_detection_counter_ = 0;
-    return;
-  }
-  if (contains_token(s, "mode=idle") && nav_goals_active_) {
-    idle_detection_counter_++;
-    if (idle_detection_counter_ >= 3) {
-      context_.set_nav_status(NavStatus::FAILED);
-    }
-  } else {
-    idle_detection_counter_ = 0;
-  }
-}
 
 void DecisionNode::auto_aim_target_callback(const std_msgs::msg::String::SharedPtr msg)
 {
-  EnemyInfo enemy;
-  if (!parse_auto_aim_target(msg->data, enemy)) {
+  bool detected;
+  double distance;
+  if (!parse_auto_aim_target(msg->data, detected, distance)) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 2000,
       "invalid auto aim target payload '%s', expected x,y,valid,id", msg->data.c_str());
     return;
   }
-  // 保留雷达提供的全局坐标（自瞄只管检测和距离，不提供 map 坐标系位置）
-  enemy.nearest_x = context_.nearest_enemy_x();
-  enemy.nearest_y = context_.nearest_enemy_y();
-  context_.update(enemy);
+  // 融合模式: 自瞄只管检测+距离, 不碰雷达的坐标字段
+  context_.update_enemy_from_aim(detected, distance);
 }
 
-bool DecisionNode::parse_auto_aim_target(const std::string & text, EnemyInfo & enemy)
+bool DecisionNode::parse_auto_aim_target(const std::string & text, bool & detected, double & distance)
 {
   std::vector<double> values;
   values.reserve(4);
@@ -391,9 +329,8 @@ bool DecisionNode::parse_auto_aim_target(const std::string & text, EnemyInfo & e
   const double valid = values[2];
   const double id = values[3];
 
-  enemy.detected = valid > 0.5 && id > 0.5;
-  enemy.nearest_distance = enemy.detected ? std::hypot(x, y) : 999.0;
-  enemy.count = enemy.detected ? 1 : 0;
+  detected = valid > 0.5 && id > 0.5;
+  distance = detected ? std::hypot(x, y) : 999.0;
   return true;
 }
 
@@ -405,44 +342,31 @@ void DecisionNode::radar_callback(const radar_msgs::msg::EnemyPosition::SharedPt
   slot.y = msg->y;
   slot.valid = (msg->x != 0.0f || msg->y != 0.0f);
 
-  // Aggregate all valid radar positions into EnemyInfo
-  EnemyInfo enemy;
-  double min_dist = 999.0;
+  // 融合模式: 聚合雷达数据, 只更新雷达负责的字段(坐标+数量+空中威胁)
   double nearest_x = 0.0, nearest_y = 0.0;
+  double min_dist = 999.0;
   int count = 0;
+  const bool pos_valid = context_.sentry_pos_valid();
   for (const auto & s : radar_positions_) {
     if (!s.valid) continue;
-    double dist = std::hypot(s.x, s.y);
-    if (dist < min_dist) {
-      min_dist = dist;
+    if (pos_valid) {
+      double dist = std::hypot(s.x - context_.sentry_x(), s.y - context_.sentry_y());
+      if (dist < min_dist) {
+        min_dist = dist;
+        nearest_x = s.x;
+        nearest_y = s.y;
+      }
+    } else if (count == 0) {
+      // odom 未就绪，使用第一个有效目标坐标作为最近参考
       nearest_x = s.x;
       nearest_y = s.y;
     }
     count++;
   }
-  if (radar_positions_[4].valid) enemy.aerial_threat = true;  // TYPE_AERIAL
-  enemy.detected = count > 0;
-  enemy.count = count;
-  enemy.nearest_distance = min_dist;
-  enemy.nearest_x = nearest_x;
-  enemy.nearest_y = nearest_y;
-  context_.update(enemy);
+  bool aerial = radar_positions_[4].valid;  // TYPE_AERIAL
+  context_.update_enemy_from_radar(nearest_x, nearest_y, count, aerial);
 }
 
-bool DecisionNode::contains_token(const std::string & text, const std::string & token)
-{
-  const auto pos = text.find(token);
-  if (pos == std::string::npos) return false;
-
-  // 检查左边界：token 必须在字符串开头、空格后或逗号后
-  if (pos > 0 && text[pos - 1] != ' ' && text[pos - 1] != ',') return false;
-
-  // 检查右边界：token 必须在字符串结尾、空格前或逗号前
-  const auto end = pos + token.size();
-  if (end < text.size() && text[end] != ' ' && text[end] != ',') return false;
-
-  return true;
-}
 
 void DecisionNode::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {

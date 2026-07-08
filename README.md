@@ -74,13 +74,13 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 | IDLE | 停 | — | 安全模式 |
 | PATROL | 巡逻路线 | MOBILITY | 后期切 fallback_patrol |
 | DEFEND/SCOUT | defend_fallback 路线 | DEFENSIVE | 防守巡逻搜索 |
-| DEFEND/TRACK | **向敌人追击** | DEFENSIVE | 追到交火距离 |
-| DEFEND/ENGAGE | 停住交火 | OFFENSIVE | 近距离射击 |
+| DEFEND/TRACK | **向敌人追击，每1s更新目标** | DEFENSIVE | 追到交火距离，跟踪移动敌人 |
+| DEFEND/ENGAGE | 停住交火，敌人退远→TRACK 追击 | OFFENSIVE | 近距离射击，1.5×距离滞回防振荡 |
 | DEFEND/EVADE | 不动 | **OFFENSIVE** | 被打立刻反击 |
 | DEFEND/HARDEN | 撤向 safe_cover | ENHANCED_DEFENSIVE | 空中威胁 |
 | ATTACK_PUSH | attack_push 路线 | OFFENSIVE | 前压 |
 | RESUPPLY | 去补给区 | MOBILITY | 多级失败兜底+冷却 |
-| RETREAT | 去补给区 | DEFENSIVE | 多级撤退兜底 |
+| RETREAT | 撤向 retreat 点 | DEFENSIVE | retreat→backup→supply→safe_cover 多级兜底 |
 
 ---
 
@@ -140,6 +140,17 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 - 自瞄不覆盖雷达坐标
 - 导航卡住时 goal 清理（combat_track / combat_evade_air）
 
+### 2026-07-08 代码审查修复（本轮）
+
+- 雷达回调增加 odom 就绪检查：odom 未就绪时使用首个有效目标坐标，不再从原点错误计算距离
+- TRACK 追击目标周期性更新：每 1s 重算追击点，跟踪移动敌人（修复追旧坐标问题）
+- RESUPPLY 补给耗尽振荡修复：`supply_backup_exhausted_` 时弹药为空也保持 RESUPPLY，防止边界振荡
+- `publish_single_goal` 补充 `waypoint_started_s_` 设置，与 `drive_route` 行为一致
+- RETREAT 撤退链重构：优先发 retreat 点 → backup_retreat_points → supply → safe_cover 多级兜底
+- ENGAGE 增加距离判断：敌人退到 `engage_distance * 1.5` 外 + 停留 ≥2s 时回 TRACK 缩近距离
+- `on_exit(DEFEND)` 清理 `enemy_lost_at_s_` 和 `last_hit_at_s_`，消除维护隐患
+- 测试从 30 个增加到 42 个，覆盖所有修复场景
+
 ### 历史改进
 - 基础稳定性（now()、RFID、空 route、hysteresis、姿态冷却去重）
 - 自瞄 String + 雷达 EnemyPosition 双源输入
@@ -165,7 +176,7 @@ SCOUT →(发现敌人)→ TRACK →(距离<3m)→ ENGAGE →(被击中)→ EVAD
 ## 十、编译与测试
 
 ```bash
-cd ~/Sentry26
+cd ~/omni_navigation
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
@@ -174,28 +185,62 @@ colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release --package
 
 # 单元测试
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON --packages-select sentry_decision
-~/Sentry26/build/sentry_decision/fsm_test
+~/omni_navigation/build/sentry_decision/fsm_test
 ```
 
 ```text
-GTest: 30/30
+GTest: 42/42
 编译: 全部通过
 ```
 
 ## 十一、运行
 
 ```bash
-cd ~/Sentry26
+cd ~/omni_navigation
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
 # 红方
 ros2 run sentry_decision sentry_decision_node --ros-args \
-  -p profile_path:=~/Sentry26/src/sentry_decision/config/profiles/rmuc_red.yaml
+  -p profile_path:=~/omni_navigation/src/sentry_decision/config/profiles/rmuc_red.yaml
 
 # 蓝方
 ros2 run sentry_decision sentry_decision_node --ros-args \
-  -p profile_path:=~/Sentry26/src/sentry_decision/config/profiles/rmuc_blue.yaml
+  -p profile_path:=~/omni_navigation/src/sentry_decision/config/profiles/rmuc_blue.yaml
+```
+
+## 十二、omni_navigation 集成说明
+
+### 本工作空间中已配好的
+
+| 接口 | 来源/去向 | 状态 |
+|------|----------|------|
+| `referee/game_status` | serial_driver → 决策 | ✅ |
+| `referee/robot_status` | serial_driver → 决策 | ✅ |
+| `referee/rfidStatus` | serial_driver → 决策 | ✅ |
+| `referee/all_robot_hp` | serial_driver → 决策 | ✅ |
+| `/odometry` | odom_bridge → 决策 | ✅ |
+| `navigate_to_pose` | 决策 → Nav2 (omni_pid_pursuit_controller) | ✅ |
+| `/goal_pose` | 决策 → Nav2 (fallback) | ✅ |
+| `sentry/command` | 决策 → serial_driver | ✅ |
+
+### 需要外部机器提供的话题
+
+| 话题 | 来源 | 不发的后果 |
+|------|------|-----------|
+| `auto_aim_target_pos` | bof_26_vision（自瞄机器） | 无近距离敌人检测 |
+| `/radar/enemy_positions` | RM2026_BOF_Radar（雷达站） | 无全局敌方坐标，TRACK 无法追击 |
+
+### 本工作空间缺少的（不影响基础运行）
+
+| 话题 | 说明 |
+|------|------|
+| `motion_manager/state` | omni 无独立 motion_manager。决策通过 Nav2 action feedback 判断到达，不依赖此话题 |
+| `motion_manager/motion_state` | 同上 |
+
+```text
+GTest: 42/42
+编译: 全部通过
 ```
 
 ## 十二、更多文档

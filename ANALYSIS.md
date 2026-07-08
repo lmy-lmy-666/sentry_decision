@@ -224,6 +224,42 @@ Nav2 不可用时 `cancel_nav()` 也正确清理 `nav_goals_active_` 和 `fallba
 - 裁判数据流：外部学校 bag → 决策 PATROL→RESUPPLY→RETREAT→IDLE（验证通过）
 - 雷达数据流：雷达测试 bag → EnemyInfo 正常填充（验证通过）
 
+### 2026-07-08 自瞄+雷达融合 + Bug修复
+
+#### 8.10 自瞄+雷达双源融合（读时融合）
+- 每个源独立维护检测标记：`aim_detected_` (自瞄) + `radar_has_target_` (雷达)
+- 各自独立时间戳 `aim_stamp_` / `radar_stamp_`
+- `enemy_detected()` 读时 OR 融合——任一方看到敌人即为真
+- 自瞄丢锁不会覆盖雷达的检测（消除竞态）
+- `enemy_info_fresh()` 任一源新鲜即有效
+- 雷达回调修正 `hypot` 参考系：从到原点改为到哨兵距离
+- 雷达回调修正最近敌人选择：恢复 `min_dist` 追踪取真正最近目标
+
+#### 8.11 Bug修复
+- **HARDEN→SCOUT goal_sent_ 未重置**：空中威胁消失回搜索时清 `goal_sent_`，防止等 safe_cover 到达才恢复巡逻
+- **EVADE OFFENSIVE 被冷却丢弃**：`combat_evade` 中 `switch_stance(OFFENSIVE, force=true)` 强制绕过 5s 冷却
+- **串口 stance 下行**：`protocol.yaml` 中 `reserved` → `stance`，`generate.py` 重生成 `packet.hpp`，`sendControlPacket` 填充 `pkt.stance`
+
+#### 8.12 代码审查修复（2026-07-08 本轮）
+
+以下问题通过全面代码审查发现并修复，测试从 30→42：
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| 雷达回调 odom 未就绪时 hypot 从原点错误计算距离 | `sentry_pos_valid()` 检查，未就绪使用首个有效目标 | decision_node.cpp |
+| TRACK 追击目标不随敌人移动更新 | 每 1s 周期性重算追击目标，直接 `publish_goal_` 更新 | fsm.cpp |
+| 补给耗尽后 RESUPPLY↔PATROL 边界振荡 | `supply_backup_exhausted_` 分支增加 `\|\| ammo_empty()` 保护 | fsm.cpp |
+| `publish_single_goal` 未设置 `waypoint_started_s_` | 函数签名增加 `now_s` 参数，统一设置时间戳 | fsm.cpp/hpp |
+| `profile.retreat` 路点是死数据 | 撤退链重构：retreat → backup → supply → safe_cover | fsm.cpp |
+| ENGAGE 中敌人超出交火距离不移动 | 增加 1.5× 滞回距离 + 2s 停留门槛，回 TRACK 缩近距离 | fsm.cpp |
+| `enemy_lost_at_s_` 未在 `on_exit(DEFEND)` 清理 | `on_exit(DEFEND)` 中清零 `enemy_lost_at_s_` 和 `last_hit_at_s_` | fsm.cpp |
+
+#### 8.12 omni_navigation 适配
+- RFID topic: `referee/rfid_status` → `referee/rfidStatus` (匹配 serial_driver)
+- rm_interfaces 补 `MotionState.msg` + `SentryCommand.msg`
+- serial_driver 加 `sentry/command` 订阅
+- 删除无效的 String+结构化 motion_state 订阅（omni 无此数据源，Nav2 feedback 兜底）
+
 ### 2026-07-05 历史修改
 
 - 基础稳定性修复（now()、RFID、空 route、hysteresis、姿态冷却去重）
@@ -410,3 +446,31 @@ ros2 run sentry_decision sentry_decision_node --ros-args \
 **验证方式**: 最优先的验证项。实车连接 STM32，在 ROS 端发布手动 `sentry/command`，通过裁判系统监控软件确认 0x0120 是否正确接收到 stance_command。
 
 **修复方向**: 如果 STM32 端未实现，需参照 `rm_interfaces/msg/SentryCommand.msg` 格式实现解析逻辑。
+
+---
+
+## 14. omni_navigation 集成记录
+
+> 日期: 2026-07-07 | 分支: fix/main-no-mppi
+
+### 工作空间适配
+
+| 项目 | 改动 |
+|------|------|
+| RFID topic | `referee/rfid_status` → `referee/rfidStatus`（匹配 omni 的 serial_driver） |
+| rm_interfaces | 补 `MotionState.msg` + `SentryCommand.msg` |
+| serial_driver | 新增 `sentry/command` 订阅，接收姿态指令 |
+| radar_msgs | 作为独立包放入 workspace（决策编译依赖） |
+
+### 导航控制器
+
+omni_navigation 使用 `omni_pid_pursuit_controller`（自研 PID 追踪），不是 MPPI。决策发 goal 到 Nav2 行为树，由该控制器执行。
+
+### 运动状态
+
+omni_navigation 无独立 `motion_manager` 节点。决策通过 Nav2 action feedback 判断 `ARRIVED` / `MOVING` / `FAILED`，不依赖 `motion_manager/state` 话题。`nav_stuck` 检测不可用（无卡住感知），但 Nav2 自带超时恢复。
+
+### 数据流验证
+
+- 裁判数据：外部学校 bag → PATROL→RESUPPLY→RETREAT→IDLE ✅
+- 单元测试：42/42 ✅

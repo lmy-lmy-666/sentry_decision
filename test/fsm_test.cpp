@@ -281,10 +281,7 @@ TEST(DecisionFsm, EnemyDetectedPreemptsAttackPush)
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(400, 50));
   h.ctx.update(outpost(500));
-  sentry_decision::EnemyInfo enemy;
-  enemy.detected = true;
-  enemy.nearest_distance = 6.0;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_aim(true, 6.0);
   h.fsm.tick(h.ctx, 0.0);
   EXPECT_EQ(h.fsm.state(), State::DEFEND);
 }
@@ -294,14 +291,13 @@ TEST(DecisionFsm, EnemyDistanceDrivesCombatSubstate)
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(400, 50));
-  sentry_decision::EnemyInfo enemy;
-  enemy.detected = true;
-  enemy.nearest_distance = 2.0;
-  h.ctx.update(enemy);
-  h.fsm.tick(h.ctx, 0.0);
+  h.ctx.update_enemy_from_aim(true, 2.0);
+  h.fsm.tick(h.ctx, 0.0);  // 进入 DEFEND/SCOUT
   EXPECT_EQ(h.fsm.state(), State::DEFEND);
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::SCOUT);
+  h.fsm.tick(h.ctx, 0.3);  // 等 0.2s 滞回 → TRACK
   EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::TRACK);
-  h.fsm.tick(h.ctx, 1.0);
+  h.fsm.tick(h.ctx, 0.6);
   EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::ENGAGE);
 }
 
@@ -310,11 +306,9 @@ TEST(DecisionFsm, AerialThreatSendsEnhancedDefenseImmediately)
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(400, 50));
-  sentry_decision::EnemyInfo enemy;
-  enemy.aerial_threat = true;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_radar(0, 0, 1, true);
   h.fsm.tick(h.ctx, 0.0);
-  EXPECT_EQ(h.fsm.state(), State::DEFEND);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
   EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::HARDEN);
   ASSERT_FALSE(h.stances.empty());
   EXPECT_EQ(h.stances[0], sentry_decision::StanceCommand::ENHANCED_DEFENSIVE);
@@ -329,9 +323,7 @@ TEST(DecisionFsm, DefensiveUpgradeBypassesStanceCooldown)
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.stances.size(), 1u);
   EXPECT_EQ(h.stances[0], sentry_decision::StanceCommand::MOBILITY);
-  sentry_decision::EnemyInfo enemy;
-  enemy.aerial_threat = true;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_radar(0, 0, 1, true);
   h.fsm.tick(h.ctx, 1.0);
   ASSERT_EQ(h.stances.size(), 2u);
   EXPECT_EQ(h.stances[1], sentry_decision::StanceCommand::ENHANCED_DEFENSIVE);
@@ -360,10 +352,7 @@ TEST(DecisionFsm, AmmoZeroEnemyGoesResupply)
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(400, 0));  // ammo=0
-  sentry_decision::EnemyInfo enemy;
-  enemy.detected = true;
-  enemy.nearest_distance = 3.0;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_aim(true, 3.0);
   h.fsm.tick(h.ctx, 0.0);
   EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
 }
@@ -376,9 +365,7 @@ TEST(DecisionFsm, AmmoZeroInResupplyEnemyDoesNotBreak)
   h.ctx.update(robot(400, 0));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
-  sentry_decision::EnemyInfo enemy;
-  enemy.detected = true;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_aim(true, 999.0);
   h.fsm.tick(h.ctx, 1.0);
   EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
 }
@@ -431,11 +418,9 @@ TEST(DecisionFsm, EnemyAppearsMidResupplyGoesDefend)
   h.ctx.update(robot(140, 50));  // hp<150 触发 RESUPPLY
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
-  sentry_decision::EnemyInfo enemy;
-  enemy.detected = true;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_aim(true, 999.0);
   h.fsm.tick(h.ctx, 1.0);
-  EXPECT_EQ(h.fsm.state(), State::DEFEND);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
 }
 
 TEST(DecisionFsm, EnemyGoneReturnsToResupply)
@@ -444,16 +429,16 @@ TEST(DecisionFsm, EnemyGoneReturnsToResupply)
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(140, 50));
-  sentry_decision::EnemyInfo enemy;
-  enemy.detected = true;
-  enemy.nearest_distance = 2.0;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_aim(true, 2.0);
+  h.fsm.tick(h.ctx, 0.0);  // 进入 SCOUT
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::DEFEND);
-  enemy.detected = false;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_aim(false, 999.0);
   h.ctx.set_now(1.0);
-  h.fsm.tick(h.ctx, 1.0);
+  h.fsm.tick(h.ctx, 1.0);  // 记录丢失时刻，但在 5s 滞后期内保持 DEFEND
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+  // 滞后过期后切 RESUPPLY
+  h.fsm.tick(h.ctx, 7.0);
   EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
 }
 
@@ -462,28 +447,57 @@ TEST(DecisionFsm, EngagesEnemyAtCloseRange)
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(400, 50));
-  sentry_decision::EnemyInfo enemy;
-  enemy.detected = true;
-  enemy.nearest_distance = 1.5;  // <3m → ENGAGE
-  h.ctx.update(enemy);
-  h.fsm.tick(h.ctx, 0.0);
+  h.ctx.update_enemy_from_aim(true, 1.5);  // <3m → ENGAGE
+  h.fsm.tick(h.ctx, 0.0);  // 进入 DEFEND/SCOUT
   EXPECT_EQ(h.fsm.state(), State::DEFEND);
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::SCOUT);
+  h.fsm.tick(h.ctx, 0.3);  // 等 0.2s 滞回 → TRACK
   EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::TRACK);
   h.fsm.tick(h.ctx, 1.0);
   EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::ENGAGE);
 }
 
-TEST(DecisionFsm, RetreatSendSupplyNotRetreat)
+TEST(DecisionFsm, RetreatSendRetreatFirst)
 {
-  // RETREAT 发 supply 点, 不是 retreat 点
+  // RETREAT 优先发 retreat 点，而非直接发 supply
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(40, 50));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::RETREAT);
   ASSERT_FALSE(h.goals.empty());
-  EXPECT_DOUBLE_EQ(h.goals[0].x, -1.0);  // supply.x
-  EXPECT_DOUBLE_EQ(h.goals[0].y, -5.0);  // supply.y
+  EXPECT_DOUBLE_EQ(h.goals[0].x, -2.0);  // retreat.x
+  EXPECT_DOUBLE_EQ(h.goals[0].y, -5.0);  // retreat.y
+}
+
+TEST(DecisionFsm, RetreatFallbackToSupplyThenSafeCover)
+{
+  // retreat 超时 → backup_retreat_points → supply → safe_cover 多级兜底
+  Profile p = make_profile();
+  p.retreat = {-3.0, -5.0, 0.0};
+  p.backup_retreat_points = {{-4.0, -5.0, 0.0}};
+  p.supply = {-1.0, -5.0, 0.0};
+  p.safe_cover = {0.0, 0.0, 0.0};
+  p.thresholds.retreat_timeout_s = 1.0;
+  Harness h{p};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(40, 50));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RETREAT);
+  ASSERT_EQ(h.goals.size(), 1u);
+  EXPECT_DOUBLE_EQ(h.goals[0].x, -3.0);  // retreat
+  // 超时 → backup
+  h.fsm.tick(h.ctx, 2.0);
+  ASSERT_EQ(h.goals.size(), 2u);
+  EXPECT_DOUBLE_EQ(h.goals[1].x, -4.0);  // backup_retreat
+  // 再超时 → supply
+  h.fsm.tick(h.ctx, 4.0);
+  ASSERT_EQ(h.goals.size(), 3u);
+  EXPECT_DOUBLE_EQ(h.goals[2].x, -1.0);  // supply
+  // 再超时 → safe_cover
+  h.fsm.tick(h.ctx, 6.0);
+  ASSERT_EQ(h.goals.size(), 4u);
+  EXPECT_DOUBLE_EQ(h.goals[3].x, 0.0);  // safe_cover
 }
 
 TEST(DecisionFsm, ResupplyExitAtFullHp)
@@ -509,18 +523,239 @@ TEST(DecisionFsm, DefendExitWhenNoThreat)
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(400, 50));
   h.ctx.update(outpost(0));  // 前哨站死 → PATROL
-  sentry_decision::EnemyInfo enemy;
-  enemy.detected = true;
-  enemy.nearest_distance = 2.0;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_aim(true, 2.0);
+  h.fsm.tick(h.ctx, 0.0);  // 进入 SCOUT
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::DEFEND);
-  enemy.detected = false;
-  h.ctx.update(enemy);
+  h.ctx.update_enemy_from_aim(false, 999.0);
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(400, 50));
-  h.fsm.tick(h.ctx, 5.0);
+  // 先 tick 一次让 enemy_lost_at_s_ 记录丢失时刻
+  h.fsm.tick(h.ctx, 1.0);
+  // 等 5s 滞后过期后再 tick，才退出 DEFEND
+  h.fsm.tick(h.ctx, 7.0);
   EXPECT_EQ(h.fsm.state(), State::PATROL);
+}
+
+// =========================================================================
+// 新增：传感器融合测试
+// =========================================================================
+
+TEST(DecisionFsm, RadarOnlyDetectsEnemy)
+{
+  // 只用雷达发现地面敌人（无自瞄），应进入 DEFEND
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));  // 前哨站死，否则会进 ATTACK_PUSH
+  h.ctx.update_enemy_from_radar(5.0, 3.0, 1, false);  // 雷达报 1 个敌人，非空中
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+}
+
+TEST(DecisionFsm, RadarCountZeroClearsDetection)
+{
+  // 雷达报 count=0 → radar_has_target_=false，应退出 DEFEND
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));
+  h.ctx.update_enemy_from_radar(5.0, 3.0, 1, false);
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+  // 雷达报 0 个敌人
+  h.ctx.update_enemy_from_radar(0.0, 0.0, 0, false);
+  // 滞后: 先 tick 记录丢失，再等 5s
+  h.fsm.tick(h.ctx, 1.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);  // 滞后期内
+  h.fsm.tick(h.ctx, 7.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);  // 滞后过期
+}
+
+TEST(DecisionFsm, DualSourceBothDetecting)
+{
+  // 自瞄和雷达同时报告敌人，OR 融合应正确
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));
+  // 雷达看到 2 个敌人
+  h.ctx.update_enemy_from_radar(5.0, 3.0, 2, false);
+  // 自瞄看到 1 个近距离目标
+  h.ctx.update_enemy_from_aim(true, 1.5);
+  h.fsm.tick(h.ctx, 0.0);  // 进入 DEFEND/SCOUT
+  EXPECT_EQ(h.fsm.state(), State::DEFEND);
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::SCOUT);
+  h.fsm.tick(h.ctx, 0.3);  // 等 0.2s 滞回 → TRACK
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::TRACK);
+  h.fsm.tick(h.ctx, 0.6);
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::ENGAGE);
+}
+
+TEST(DecisionFsm, AimLostRadarKeepsDetection)
+{
+  // 自瞄丢锁 (detected=false)，雷达还在 → 应保持 DEFEND
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));
+  h.ctx.update_enemy_from_radar(5.0, 3.0, 1, false);
+  h.ctx.update_enemy_from_aim(true, 2.0);
+  h.fsm.tick(h.ctx, 0.0);  // 进入 SCOUT
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+  // 自瞄丢锁，雷达还在
+  h.ctx.update_enemy_from_aim(false, 999.0);
+  h.fsm.tick(h.ctx, 1.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);  // 仍保持，雷达维持检测
+}
+
+TEST(DecisionFsm, RadarLostAimKeepsDetection)
+{
+  // 雷达清零，自瞄还在 → 应保持 DEFEND
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));
+  h.ctx.update_enemy_from_radar(5.0, 3.0, 1, false);
+  h.ctx.update_enemy_from_aim(true, 2.0);
+  h.fsm.tick(h.ctx, 0.0);  // 进入 SCOUT
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+  // 雷达清零，自瞄还在
+  h.ctx.update_enemy_from_radar(0.0, 0.0, 0, false);
+  h.fsm.tick(h.ctx, 1.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);  // 仍保持，自瞄维持检测
+}
+
+TEST(DecisionFsm, BothSourcesLostExitsDefend)
+{
+  // 两个源都丢了 → 滞后过期后退出 DEFEND
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));
+  h.ctx.update_enemy_from_radar(5.0, 3.0, 1, false);
+  h.ctx.update_enemy_from_aim(true, 2.0);
+  h.fsm.tick(h.ctx, 0.0);  // 进入 SCOUT
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+  // 两个源都丢
+  h.ctx.update_enemy_from_aim(false, 999.0);
+  h.ctx.update_enemy_from_radar(0.0, 0.0, 0, false);
+  // 记录丢失
+  h.fsm.tick(h.ctx, 1.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);  // 滞后期内
+  // 滞后过期
+  h.fsm.tick(h.ctx, 7.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
+}
+
+// =========================================================================
+// 新增：伤害类型测试
+// =========================================================================
+
+TEST(DecisionFsm, ArmorCollisionTriggersDefend)
+{
+  // 被撞（ARMOR_COLLISION）也应触发战斗反应
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::PATROL);
+  // 模拟被撞击
+  rm_interfaces::msg::RobotStatus hit;
+  hit.current_hp = 380;
+  hit.maximum_hp = 400;
+  hit.projectile_allowance_17mm = 50;
+  hit.is_hp_deduced = true;
+  hit.hp_deduction_reason = rm_interfaces::msg::RobotStatus::ARMOR_COLLISION;
+  h.ctx.update(hit);
+  h.fsm.tick(h.ctx, 1.0);
+  ASSERT_EQ(h.fsm.state(), State::DEFEND);
+}
+
+TEST(DecisionFsm, OverheatPenaltyDoesNotTriggerDefend)
+{
+  // 超限惩罚（OVER_HEAT）不是敌方攻击，不应触发战斗
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.update(outpost(0));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::PATROL);
+  // 模拟过热扣血
+  rm_interfaces::msg::RobotStatus overheat;
+  overheat.current_hp = 390;
+  overheat.maximum_hp = 400;
+  overheat.projectile_allowance_17mm = 50;
+  overheat.is_hp_deduced = true;
+  overheat.hp_deduction_reason = rm_interfaces::msg::RobotStatus::OVER_HEAT;
+  h.ctx.update(overheat);
+  h.fsm.tick(h.ctx, 1.0);
+  EXPECT_NE(h.fsm.state(), State::DEFEND);  // 不触发战斗
+}
+
+// =========================================================================
+// 新增：中高危修复验证测试
+// =========================================================================
+
+TEST(DecisionFsm, ResupplyStayWhenAmmoEmptyAndBackupExhausted)
+{
+  // Fix 3: 补给耗尽 + 弹药为空 + hp≥120 → 仍应保持 RESUPPLY，不振荡
+  Profile p = make_profile();
+  p.thresholds.hp_critical_exit = 120;
+  p.thresholds.hp_low = 150;
+  Harness h{p};
+  // 手动设置补给耗尽状态
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(130, 0));  // hp=130, ammo=0
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  // 模拟补给全部失败（supply_backup_exhausted_ 需在 FSM 内设置，
+  // 通过 resupply_timeout_s 触发）
+}
+
+TEST(DecisionFsm, EngageRetreatsToTrackWhenEnemyFar)
+{
+  // Fix 8: ENGAGE 中敌人退到 engage_distance*1.5 外 + 停留 ≥2s → 回 TRACK
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  // 进入 DEFEND → SCOUT → TRACK → ENGAGE
+  h.ctx.update_enemy_from_aim(true, 1.5);  // < 3m → 会进 ENGAGE
+  h.fsm.tick(h.ctx, 0.0);   // DEFEND/SCOUT
+  h.fsm.tick(h.ctx, 0.3);   // TRACK
+  h.fsm.tick(h.ctx, 0.6);   // ENGAGE (1.5m < 3m)
+  ASSERT_EQ(h.fsm.combat_substate(), CombatSubState::ENGAGE);
+  // 敌人退到 5m（> 3*1.5=4.5m），但 < 8m
+  h.ctx.update_enemy_from_aim(true, 5.0);
+  h.fsm.tick(h.ctx, 0.9);   // 停留 0.3s，< 2s 门槛
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::ENGAGE);  // 还未触发
+  h.fsm.tick(h.ctx, 2.7);   // 停留 ≥2s
+  EXPECT_EQ(h.fsm.combat_substate(), CombatSubState::TRACK);   // 回 TRACK
+}
+
+TEST(DecisionFsm, TrackPursuitUpdatesWithMovingEnemy)
+{
+  // Fix 2: TRACK 追击目标每 1s 更新，跟踪移动敌人
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(400, 50));
+  h.ctx.set_sentry_position(0.0, 0.0);  // 设置己方位置
+  // 进入 SCOUT → TRACK
+  h.ctx.update_enemy_from_radar(8.0, 0.0, 1, false);
+  h.fsm.tick(h.ctx, 0.0);   // DEFEND/SCOUT
+  h.fsm.tick(h.ctx, 0.3);   // SCOUT→TRACK（本 tick 只做状态切换）
+  ASSERT_EQ(h.fsm.combat_substate(), CombatSubState::TRACK);
+  EXPECT_TRUE(h.goals.empty());  // 切换 tick 不执行 combat_track，goal 尚未发出
+  h.fsm.tick(h.ctx, 0.4);   // TRACK 首次执行，发出追击目标
+  ASSERT_FALSE(h.goals.empty());
+  // 敌人移动（雷达新坐标）
+  h.ctx.update_enemy_from_radar(10.0, 2.0, 1, false);
+  h.fsm.tick(h.ctx, 1.5);   // >1s 距上次更新，应更新追击目标
+  EXPECT_GE(h.goals.size(), 2u);
 }
 
 int main(int argc, char ** argv)

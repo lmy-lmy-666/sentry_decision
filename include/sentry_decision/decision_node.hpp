@@ -28,7 +28,6 @@
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rm_interfaces/msg/game_robot_hp.hpp"
 #include "rm_interfaces/msg/game_status.hpp"
-#include "rm_interfaces/msg/motion_state.hpp"
 #include "rm_interfaces/msg/rfid_status.hpp"
 #include "rm_interfaces/msg/robot_status.hpp"
 #include "rm_interfaces/msg/sentry_command.hpp"
@@ -58,14 +57,11 @@ private:
     GoalHandleNavigateToPose::SharedPtr goal_handle,
     const std::shared_ptr<const NavigateToPose::Feedback> feedback);
   void result_callback(const GoalHandleNavigateToPose::WrappedResult & result);
-  void motion_state_callback(const std_msgs::msg::String::SharedPtr msg);
-  void motion_state_structured_callback(const rm_interfaces::msg::MotionState::SharedPtr msg);
   void auto_aim_target_callback(const std_msgs::msg::String::SharedPtr msg);
   void radar_callback(const radar_msgs::msg::EnemyPosition::SharedPtr msg);
   void odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
 
-  static bool contains_token(const std::string & text, const std::string & token);
-  static bool parse_auto_aim_target(const std::string & text, EnemyInfo & enemy);
+  static bool parse_auto_aim_target(const std::string & text, bool & detected, double & distance);
 
   Context context_;
   std::unique_ptr<DecisionFsm> fsm_;
@@ -77,8 +73,6 @@ private:
   rclcpp::Subscription<rm_interfaces::msg::RobotStatus>::SharedPtr sub_robot_status_;
   rclcpp::Subscription<rm_interfaces::msg::RfidStatus>::SharedPtr sub_rfid_status_;
   rclcpp::Subscription<rm_interfaces::msg::GameRobotHP>::SharedPtr sub_robot_hp_;
-  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_motion_state_;
-  rclcpp::Subscription<rm_interfaces::msg::MotionState>::SharedPtr sub_motion_state_structured_;
   rclcpp::Subscription<radar_msgs::msg::EnemyPosition>::SharedPtr sub_radar_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_auto_aim_target_;
@@ -97,7 +91,6 @@ private:
   double fallback_goal_x_{0.0};
   double fallback_goal_y_{0.0};
   bool fallback_goal_active_{false};
-  int idle_detection_counter_{0};
 
   struct RadarSlot
   {

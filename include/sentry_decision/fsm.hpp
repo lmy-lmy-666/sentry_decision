@@ -69,7 +69,7 @@ private:
   void combat_evade_air(const Context & ctx, double now_s);
 
   void drive_route(const Route & route, double now_s);
-  void publish_single_goal(const Waypoint & wp);
+  void publish_single_goal(const Waypoint & wp, double now_s);
   void switch_stance(StanceCommand stance, double now_s, bool force = false);
 
   Profile profile_;
@@ -99,6 +99,7 @@ private:
 
   StanceCommand last_commanded_stance_{StanceCommand::NONE};
   double last_stance_command_s_{-1e9};
+  double last_pursuit_update_s_{0.0};
 };
 
 }  // namespace sentry_decision

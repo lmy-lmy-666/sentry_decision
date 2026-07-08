@@ -30,6 +30,15 @@ DecisionFsm::DecisionFsm(
 
 void DecisionFsm::tick(const Context & ctx, double now_s)
 {
+  // 敌人丢失计时——必须在 select_state 之前更新，否则读到的永远是旧值
+  if (state_ == State::DEFEND) {
+    if (ctx.enemy_detected() || ctx.under_attack() || ctx.under_aerial_attack()) {
+      enemy_lost_at_s_ = 0.0;
+    } else if (enemy_lost_at_s_ == 0.0) {
+      enemy_lost_at_s_ = now_s;
+    }
+  }
+
   const State candidate = select_state(ctx, now_s);
   const State next = can_leave_current_state(candidate) ? candidate : state_;
 
@@ -64,7 +73,7 @@ State DecisionFsm::select_state(const Context & ctx, double now_s) const
     // 有弹药但 hp 低时，敌人出现才让路给 DEFEND
     if (ctx.ammo_empty() || !ctx.enemy_detected()) {
       if (supply_backup_exhausted_) {
-        if (ctx.hp() < profile_.thresholds.hp_critical_exit) {
+        if (ctx.hp() < profile_.thresholds.hp_critical_exit || ctx.ammo_empty()) {
           return State::RESUPPLY;
         }
       } else if (ctx.ammo_empty() || ctx.hp() < ctx.max_hp()) {
@@ -80,14 +89,24 @@ State DecisionFsm::select_state(const Context & ctx, double now_s) const
       (supply_fail_time_ > 0.0) &&
       (now_s - supply_fail_time_ < profile_.thresholds.supply_retry_cooldown_s);
     if (!supply_in_cooldown && (ctx.ammo_empty() || !ctx.enemy_detected())) {
-      // 没弹药时不管有没有敌人都去补给（没法打了）
-      // hp 低但弹药充足时，敌人在就先战斗
-      return State::RESUPPLY;
+      // 敌人刚消失时暂不切 RESUPPLY——遵守与 DEFEND 相同的滞后延迟
+      if (state_ == State::DEFEND && enemy_lost_at_s_ > 0.0 &&
+          now_s - enemy_lost_at_s_ < profile_.thresholds.enemy_lost_time_s) {
+        // 还在滞后期内，保持 DEFEND，不切 RESUPPLY
+      } else {
+        return State::RESUPPLY;
+      }
     }
   }
 
   if (ctx.enemy_detected() || ctx.under_attack()) {
     return State::DEFEND;
+  }
+
+  // 敌人刚消失时暂不退出 DEFEND——滞后 enemy_lost_time_s(默认5s)防止振荡
+  if (state_ == State::DEFEND && enemy_lost_at_s_ > 0.0 &&
+      now_s - enemy_lost_at_s_ < profile_.thresholds.enemy_lost_time_s) {
+    return State::DEFEND;  // 还在滞后期内，保持 DEFEND
   }
 
   if (attack_push_allowed(ctx)) {
@@ -165,6 +184,8 @@ void DecisionFsm::on_exit(State s)
   if (s == State::DEFEND) {
     combat_substate_ = CombatSubState::SCOUT;
     attack_source_ = AttackSource::NONE;
+    enemy_lost_at_s_ = 0.0;
+    last_hit_at_s_ = 0.0;
   }
 }
 
@@ -239,12 +260,6 @@ void DecisionFsm::run_combat_fsm(const Context & ctx, double now_s)
 
   if (ctx.under_attack()) last_hit_at_s_ = now_s;
 
-  if (!ctx.enemy_detected() && !ctx.under_attack() && !ctx.under_aerial_attack()) {
-    if (enemy_lost_at_s_ == 0.0) enemy_lost_at_s_ = now_s;
-  } else {
-    enemy_lost_at_s_ = 0.0;
-  }
-
   switch (combat_substate_) {
     case CombatSubState::SCOUT:
       combat_scout(ctx, now_s);
@@ -273,7 +288,8 @@ void DecisionFsm::run_combat_fsm(const Context & ctx, double now_s)
 
 void DecisionFsm::combat_scout(const Context & ctx, double now_s)
 {
-  if (ctx.enemy_detected()) {
+  // SCOUT→TRACK 需至少停留 2 ticks，防止自瞄丢帧导致闪烁切换
+  if (ctx.enemy_detected() && now_s - substate_entered_s_ > 0.2) {
     combat_substate_ = CombatSubState::TRACK;
     switch_stance(StanceCommand::DEFENSIVE, now_s);
     goal_sent_ = false;
@@ -285,10 +301,6 @@ void DecisionFsm::combat_scout(const Context & ctx, double now_s)
     switch_stance(StanceCommand::DEFENSIVE, now_s);
     goal_sent_ = false;
     return;
-  }
-
-  if (enemy_lost_at_s_ > 0.0 && now_s - enemy_lost_at_s_ > profile_.thresholds.enemy_lost_time_s) {
-    combat_substate_ = CombatSubState::SCOUT;
   }
 
   // 没有发现敌人时用 defend_fallback 做防守巡逻
@@ -303,7 +315,8 @@ void DecisionFsm::combat_scout(const Context & ctx, double now_s)
 
 void DecisionFsm::combat_track(const Context & ctx, double now_s)
 {
-  if (!ctx.enemy_detected()) {
+  // TRACK→SCOUT 需至少停留 2 ticks，防止自瞄丢帧导致闪烁切换
+  if (!ctx.enemy_detected() && now_s - substate_entered_s_ > 0.2) {
     combat_substate_ = CombatSubState::SCOUT;
     return;
   }
@@ -320,10 +333,11 @@ void DecisionFsm::combat_track(const Context & ctx, double now_s)
   }
 
   // 向最近敌人方向移动，缩短距离而非原地等待
+  // 需要己方位置已知才计算追击目标（odom 未就绪时跳过）
   if (ctx.nav_stuck()) {
     goal_sent_ = false;
   }
-  if (!goal_sent_) {
+  if (!goal_sent_ && ctx.sentry_pos_valid()) {
     double dx = ctx.nearest_enemy_x() - ctx.sentry_x();
     double dy = ctx.nearest_enemy_y() - ctx.sentry_y();
     double dist = std::hypot(dx, dy);
@@ -334,7 +348,26 @@ void DecisionFsm::combat_track(const Context & ctx, double now_s)
       Waypoint pursue;
       pursue.x = ctx.sentry_x() + dx / dist * target_dist;
       pursue.y = ctx.sentry_y() + dy / dist * target_dist;
-      publish_single_goal(pursue);
+      publish_single_goal(pursue, now_s);
+      last_pursuit_update_s_ = now_s;
+    }
+  }
+
+  // 追击目标周期性更新：每 1s 重算，跟踪移动敌人
+  if (goal_sent_ && ctx.sentry_pos_valid() && now_s - last_pursuit_update_s_ > 1.0) {
+    double dx = ctx.nearest_enemy_x() - ctx.sentry_x();
+    double dy = ctx.nearest_enemy_y() - ctx.sentry_y();
+    double dist = std::hypot(dx, dy);
+    if (dist > 0.1) {
+      double target_dist = dist - profile_.thresholds.engage_distance;
+      if (target_dist < 0.0) target_dist = 0.0;
+      Waypoint pursue;
+      pursue.x = ctx.sentry_x() + dx / dist * target_dist;
+      pursue.y = ctx.sentry_y() + dy / dist * target_dist;
+      publish_goal_(pursue);
+      goal_sent_ = true;
+      waypoint_started_s_ = now_s;
+      last_pursuit_update_s_ = now_s;
     }
   }
 
@@ -357,6 +390,16 @@ void DecisionFsm::combat_engage(const Context & ctx, double now_s)
     switch_stance(StanceCommand::DEFENSIVE, now_s);
     return;
   }
+  // 敌人退出交火距离但仍在追踪范围内 → 回 TRACK 缩近距离
+  // 1.5 倍滞回防止 TRACK↔ENGAGE 振荡，最少停留 2s 才允许此转换
+  if (
+    ctx.enemy_distance() > profile_.thresholds.engage_distance * 1.5 &&
+    now_s - substate_entered_s_ > 2.0) {
+    combat_substate_ = CombatSubState::TRACK;
+    switch_stance(StanceCommand::DEFENSIVE, now_s);
+    goal_sent_ = false;
+    return;
+  }
   if (ctx.under_attack() && now_s - last_hit_at_s_ < 0.5) {
     combat_substate_ = CombatSubState::EVADE;
     switch_stance(StanceCommand::DEFENSIVE, now_s);
@@ -374,8 +417,8 @@ void DecisionFsm::combat_engage(const Context & ctx, double now_s)
 
 void DecisionFsm::combat_evade(const Context & ctx, double now_s)
 {
-  // 场地没有掩体可躲，最有效的闪避是立刻反击
-  switch_stance(StanceCommand::OFFENSIVE, now_s);
+  // 场地没有掩体可躲，最有效的闪避是立刻反击（强制绕过冷却）
+  switch_stance(StanceCommand::OFFENSIVE, now_s, /*force=*/true);
 
   if (!ctx.under_attack() && now_s - last_hit_at_s_ > 1.0) {
     // 1s 没再被打 → 回 SCOUT，自瞄会重新锁定继续打
@@ -390,21 +433,24 @@ void DecisionFsm::combat_harden(const Context & ctx, double now_s)
     now_s - substate_entered_s_ <= profile_.thresholds.enhanced_defense_duration_s) {
     switch_stance(StanceCommand::ENHANCED_DEFENSIVE, now_s);
   }
-  if (!goal_sent_) publish_single_goal(profile_.safe_cover);
+  if (!goal_sent_) publish_single_goal(profile_.safe_cover, now_s);
 
   if (now_s - substate_entered_s_ > profile_.thresholds.enhanced_defense_duration_s) {
     combat_substate_ = CombatSubState::EVADE_AIR;
     switch_stance(StanceCommand::DEFENSIVE, now_s);
     return;
   }
-  if (!ctx.under_aerial_attack()) combat_substate_ = CombatSubState::SCOUT;
+  if (!ctx.under_aerial_attack()) {
+    combat_substate_ = CombatSubState::SCOUT;
+    goal_sent_ = false;
+  }
 }
 
 void DecisionFsm::combat_evade_air(const Context & ctx, double now_s)
 {
   switch_stance(StanceCommand::DEFENSIVE, now_s);
   if (ctx.nav_stuck()) goal_sent_ = false;
-  if (!goal_sent_) publish_single_goal(profile_.safe_cover);
+  if (!goal_sent_) publish_single_goal(profile_.safe_cover, now_s);
   if (!ctx.under_aerial_attack()) combat_substate_ = CombatSubState::SCOUT;
 }
 
@@ -415,7 +461,6 @@ void DecisionFsm::behave_attack_push(const Context & ctx, double now_s)
     goal_sent_ = false;
     return;
   }
-  if (ctx.double_vulnerability_active()) switch_stance(StanceCommand::ENHANCED_OFFENSIVE, now_s);
   drive_route(profile_.attack_push, now_s);
 }
 
@@ -429,7 +474,7 @@ void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
   }
 
   if (!goal_sent_) {
-    publish_single_goal(profile_.supply);
+    publish_single_goal(profile_.supply, now_s);
     return;
   }
 
@@ -437,7 +482,7 @@ void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
     if (
       !profile_.backup_supply_points.empty() && path_idx_ < profile_.backup_supply_points.size()) {
       goal_sent_ = false;
-      publish_single_goal(profile_.backup_supply_points[path_idx_++]);
+      publish_single_goal(profile_.backup_supply_points[path_idx_++], now_s);
       operation_started_s_ = now_s;
       return;
     }
@@ -449,8 +494,7 @@ void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
 void DecisionFsm::behave_retreat(const Context & ctx, double now_s)
 {
   if (!goal_sent_) {
-    // 直接撤到补给区，既能回血又能补弹，卡住再走备份链
-    publish_single_goal(profile_.supply);
+    publish_single_goal(profile_.retreat, now_s);
     return;
   }
   if (ctx.hp() < ctx.max_hp() * 0.05) switch_stance(StanceCommand::ENHANCED_DEFENSIVE, now_s);
@@ -464,13 +508,19 @@ void DecisionFsm::behave_retreat(const Context & ctx, double now_s)
       !profile_.backup_retreat_points.empty() &&
       path_idx_ < profile_.backup_retreat_points.size()) {
       goal_sent_ = false;
-      publish_single_goal(profile_.backup_retreat_points[path_idx_++]);
+      publish_single_goal(profile_.backup_retreat_points[path_idx_++], now_s);
       operation_started_s_ = now_s;
     } else if (path_idx_ == profile_.backup_retreat_points.size()) {
+      // 备用撤退点用完 → 尝试补给区（既能回血又能补弹）
       goal_sent_ = false;
-      publish_single_goal(profile_.safe_cover);
+      publish_single_goal(profile_.supply, now_s);
       operation_started_s_ = now_s;
       path_idx_++;
+    } else {
+      // 补给区也失败 → 最后兜底 safe_cover
+      goal_sent_ = false;
+      publish_single_goal(profile_.safe_cover, now_s);
+      operation_started_s_ = now_s;
     }
   }
 }
@@ -490,6 +540,13 @@ void DecisionFsm::drive_route(const Route & route, double now_s)
     return;
   }
 
+  // 路点超时保护：若 stuck_timeout_s 内未到达，跳下一路点
+  if (!goal_arrived_ && now_s - waypoint_started_s_ > profile_.thresholds.stuck_timeout_s) {
+    path_idx_ = (path_idx_ + 1) % route.size();
+    goal_sent_ = false;
+    return;
+  }
+
   if (!goal_arrived_) {
     return;
   }
@@ -501,12 +558,13 @@ void DecisionFsm::drive_route(const Route & route, double now_s)
   }
 }
 
-void DecisionFsm::publish_single_goal(const Waypoint & wp)
+void DecisionFsm::publish_single_goal(const Waypoint & wp, double now_s)
 {
   if (!goal_sent_) {
     publish_goal_(wp);
     goal_sent_ = true;
     goal_arrived_ = false;
+    waypoint_started_s_ = now_s;
     waypoint_arrived_s_ = 0.0;
   }
 }

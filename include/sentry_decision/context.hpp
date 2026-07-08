@@ -45,13 +45,37 @@ public:
     robot_status_ = m;
     robot_status_stamp_ = now();
   }
-  void update(const rm_interfaces::msg::RfidStatus & m) { rfid_status_ = m; }
-  void update(const rm_interfaces::msg::GameRobotHP & m) { robot_hp_ = m; }
-  void update(const EnemyInfo & m)
+  void update(const rm_interfaces::msg::RfidStatus & m)
   {
-    enemy_info_ = m;
-    enemy_info_stamp_ = now();
+    rfid_status_ = m;
+    rfid_stamp_ = now();
   }
+  void update(const rm_interfaces::msg::GameRobotHP & m)
+  {
+    robot_hp_ = m;
+    robot_hp_stamp_ = now();
+  }
+  // === 双源敌方信息融合（读时融合） ===
+  // 每个源独立维护自己的检测标记，互不覆盖。
+  // enemy_detected() 在读取时做 OR 融合——任意一方看到敌人即为真。
+  void update_enemy_from_aim(bool detected, double distance)
+  {
+    if (!enemy_info_) enemy_info_ = EnemyInfo{};
+    aim_detected_ = detected;
+    enemy_info_->nearest_distance = detected ? distance : 999.0;
+    aim_stamp_ = now();
+  }
+  void update_enemy_from_radar(double x, double y, int count, bool aerial)
+  {
+    if (!enemy_info_) enemy_info_ = EnemyInfo{};
+    radar_has_target_ = (count > 0);
+    enemy_info_->nearest_x = x;
+    enemy_info_->nearest_y = y;
+    enemy_info_->count = count;
+    enemy_info_->aerial_threat = aerial;
+    radar_stamp_ = now();
+  }
+
   void update(const SentryInfo & m) { sentry_info_ = m; }
 
   bool has_referee() const { return game_status_ && robot_status_; }
@@ -107,21 +131,32 @@ public:
     return !under_attack();
   }
 
-  bool outpost_alive() const { return robot_hp_ && robot_hp_->ally_outpost_hp > 0; }
-  uint16_t ally_base_hp() const { return robot_hp_ ? robot_hp_->ally_base_hp : 0; }
+  bool hp_data_fresh() const
+  {
+    return robot_hp_ && (now() - robot_hp_stamp_) < thresholds_.referee_stale_timeout_s;
+  }
+  bool rfid_fresh() const
+  {
+    return rfid_status_ && (now() - rfid_stamp_) < thresholds_.referee_stale_timeout_s;
+  }
+
+  bool outpost_alive() const { return hp_data_fresh() && robot_hp_->ally_outpost_hp > 0; }
+  uint16_t ally_base_hp() const { return hp_data_fresh() ? robot_hp_->ally_base_hp : 0; }
 
   bool on_supply_pad() const
   {
-    return rfid_status_ && (rfid_status_->friendly_supply_zone_non_exchange ||
+    return rfid_fresh() && (rfid_status_->friendly_supply_zone_non_exchange ||
                             rfid_status_->friendly_supply_zone_exchange);
   }
 
-  bool on_base_gain_point() const { return rfid_status_ && rfid_status_->base_gain_point; }
+  bool on_base_gain_point() const { return rfid_fresh() && rfid_status_->base_gain_point; }
 
+  // 装甲中弹 或 被撞击——都是敌方造成的伤害
   bool under_attack() const
   {
     return robot_status_ && robot_status_->is_hp_deduced &&
-           robot_status_->hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_HIT;
+           (robot_status_->hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_HIT ||
+            robot_status_->hp_deduction_reason == rm_interfaces::msg::RobotStatus::ARMOR_COLLISION);
   }
 
   uint8_t hit_armor_id() const { return robot_status_ ? robot_status_->armor_id : 0; }
@@ -142,11 +177,24 @@ public:
     }
   }
 
-  bool enemy_info_fresh() const { return enemy_info_ && (now() - enemy_info_stamp_) < thresholds_.enemy_stale_timeout_s; }
+  // 自瞄或雷达任一有新鲜数据即可，不限来源
+  bool enemy_info_fresh() const
+  {
+    if (!enemy_info_) return false;
+    const double t = now();
+    return (t - aim_stamp_) < thresholds_.enemy_stale_timeout_s ||
+           (t - radar_stamp_) < thresholds_.enemy_stale_timeout_s;
+  }
 
   bool under_aerial_attack() const { return enemy_info_fresh() && enemy_info_->aerial_threat; }
 
-  bool enemy_detected() const { return enemy_info_fresh() && enemy_info_->detected; }
+  // 读时融合: 自瞄或雷达任一确认有敌人 → true。互不覆盖，无竞态。
+  bool enemy_detected() const
+  {
+    const double t = now();
+    return (aim_detected_ && (t - aim_stamp_) < thresholds_.enemy_stale_timeout_s) ||
+           (radar_has_target_ && (t - radar_stamp_) < thresholds_.enemy_stale_timeout_s);
+  }
 
   double enemy_distance() const
   {
@@ -158,15 +206,6 @@ public:
   double nearest_enemy_y() const { return enemy_info_fresh() ? enemy_info_->nearest_y : 0.0; }
 
   int enemy_count() const { return enemy_info_fresh() ? enemy_info_->count : 0; }
-
-  bool enemy_near_base() const { return enemy_info_fresh() && enemy_info_->near_base; }
-
-  bool enemy_near_outpost() const { return enemy_info_fresh() && enemy_info_->near_outpost; }
-
-  bool double_vulnerability_active() const
-  {
-    return enemy_info_fresh() && enemy_info_->double_vulnerability_active;
-  }
 
   bool stance_expiring() const { return false; }
   double enhanced_defense_remaining() const
@@ -181,9 +220,11 @@ public:
   {
     sentry_x_ = x;
     sentry_y_ = y;
+    sentry_pos_valid_ = true;
   }
   double sentry_x() const { return sentry_x_; }
   double sentry_y() const { return sentry_y_; }
+  bool sentry_pos_valid() const { return sentry_pos_valid_; }
   bool nav_stuck() const
   {
     return nav_status_ == NavStatus::STUCK || nav_status_ == NavStatus::FAILED;
@@ -203,14 +244,20 @@ private:
   std::optional<rm_interfaces::msg::RfidStatus> rfid_status_;
   std::optional<rm_interfaces::msg::GameRobotHP> robot_hp_;
   std::optional<EnemyInfo> enemy_info_;
-  double enemy_info_stamp_{0.0};
+  double aim_stamp_{0.0};         // 自瞄最后更新时间
+  double radar_stamp_{0.0};       // 雷达最后更新时间
+  bool aim_detected_{false};      // 自瞄独立检测标记
+  bool radar_has_target_{false};  // 雷达独立检测标记
   std::optional<SentryInfo> sentry_info_;
 
   double game_status_stamp_{0.0};
   double robot_status_stamp_{0.0};
+  double rfid_stamp_{0.0};
+  double robot_hp_stamp_{0.0};
   NavStatus nav_status_{NavStatus::IDLE};
   double sentry_x_{0.0};
   double sentry_y_{0.0};
+  bool sentry_pos_valid_{false};
   Thresholds thresholds_;
 };
 

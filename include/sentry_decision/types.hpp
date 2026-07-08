@@ -120,15 +120,11 @@ enum class StanceCommand : uint8_t {
 /// once those topics are available; tests can inject it directly today.
 struct EnemyInfo
 {
-  bool detected{false};
   double nearest_distance{999.0};
   double nearest_x{0.0};
   double nearest_y{0.0};
   int count{0};
-  bool near_base{false};
-  bool near_outpost{false};
   bool aerial_threat{false};
-  bool double_vulnerability_active{false};
 };
 
 /// Semantic sentry/referee snapshot for 0x020D-like information. Currently a
