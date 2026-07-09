@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>sentry_decision_sample</name>
+  <version>0.1.0</version>
+  <description>Simplified sentry decision: PATROL when healthy, RESUPPLY when low, RETREAT when critical.</description>
+  <maintainer email="boombroke@example.com">Boombroke</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>rclcpp_components</depend>
+  <depend>nav2_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rm_interfaces</depend>
+  <depend>yaml-cpp</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

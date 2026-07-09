@@ -1,0 +1,39 @@
+# RMUC tactic profile — RED side (simplified).
+# Decision module only handles navigation: where to go next.
+# Combat (aiming, shooting, stance) is handled by vision + electronics.
+
+name: rmuc_red
+
+thresholds:
+  hp_low: 150
+  hp_critical: 60
+  hp_critical_exit: 120
+  ammo_min: 1
+  game_total_time: 420
+  min_ticks_in_state: 4
+  stuck_timeout_s: 30.0
+  resupply_timeout_s: 30.0
+  resupply_total_timeout_s: 120.0
+  retreat_timeout_s: 30.0
+  retreat_total_timeout_s: 60.0
+  referee_stale_timeout_s: 3.0
+  supply_retry_cooldown_s: 15.0
+
+# --- default patrol loop ---
+patrol:
+  - {x: 3.88, y: 2.67, dwell_s: 10.0}
+  - {x: 4.24, y: -2.54, dwell_s: 15.0}
+  - {x: 3.85, y: 2.58, dwell_s: 10.0}
+
+# --- optional: aggressive patrol when outpost is alive ---
+patrol_aggressive:
+  - {x: 8.0, y: 0.0, dwell_s: 10.0}
+
+# --- optional: conservative patrol in last 60 s ---
+patrol_late:
+  - {x: 2.0, y: 1.5, dwell_s: 10.0}
+  - {x: 2.0, y: -1.5, dwell_s: 10.0}
+
+supply: {x: -1.02, y: -4.91}
+
+backup_supply_points: []
