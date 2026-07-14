@@ -2,6 +2,10 @@
 
 > omni_navigation 工作空间核心决策层 | 基于 C++17 FSM | RM2026 赛季
 
+| 仓库 | 分支 | 本地路径 |
+|------|------|----------|
+| [lmy-lmy-666/sentry_decision](https://github.com/lmy-lmy-666/sentry_decision) | `omni_decision` | `/home/lmy/omni_navigation/src/omni_decision` |
+
 ---
 
 ## 一、在 omni_navigation 工作空间中的位置
