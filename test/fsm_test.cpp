@@ -1,6 +1,6 @@
 // Copyright 2026 Boombroke
 //
-// Unit tests for simplified DecisionFsm.
+// Unit tests for simplified DecisionFsm (3 states: IDLE / PATROL / RESUPPLY).
 //
 #include "sentry_decision_sample/fsm.hpp"
 
@@ -31,15 +31,11 @@ Profile make_profile()
   Profile p;
   p.name = "test";
   p.thresholds.hp_low = 150;
-  p.thresholds.hp_critical = 60;
-  p.thresholds.hp_critical_exit = 120;
-  p.thresholds.ammo_min = 1;
+  p.thresholds.ammo_low = 50;
+  p.thresholds.ammo_ok = 100;
   p.thresholds.game_total_time = 420;
   p.thresholds.min_ticks_in_state = 1;   // fast tests
   p.thresholds.resupply_timeout_s = 30.0;
-  p.thresholds.resupply_total_timeout_s = 120.0;
-  p.thresholds.retreat_timeout_s = 30.0;
-  p.thresholds.retreat_total_timeout_s = 60.0;
   p.patrol = {{1.0, 1.0, 5.0}, {2.0, 2.0, 5.0}};
   p.supply = {-1.0, -5.0, 0.0};
   return p;
@@ -89,6 +85,10 @@ struct Harness
 
 constexpr uint8_t RUNNING = rm_interfaces::msg::GameStatus::RUNNING;
 
+// "healthy" = full hp + plenty of ammo → PATROL
+constexpr uint16_t FULL_HP = 400;
+constexpr uint16_t FULL_AMMO = 300;
+
 }  // namespace
 
 // =============================================================================
@@ -99,7 +99,7 @@ TEST(DecisionFsm, IdleWhenGameNotRunning)
 {
   Harness h{make_profile()};
   h.ctx.update(game(rm_interfaces::msg::GameStatus::PREPARATION, 400));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   EXPECT_EQ(h.fsm.state(), State::IDLE);
 }
@@ -108,16 +108,16 @@ TEST(DecisionFsm, PatrolByDefault)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   EXPECT_EQ(h.fsm.state(), State::PATROL);
 }
 
-TEST(DecisionFsm, ResupplyWhenAmmoEmpty)
+TEST(DecisionFsm, ResupplyWhenAmmoLow)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 0));
+  h.ctx.update(robot(FULL_HP, 50));  // ammo == ammo_low → enter
   h.fsm.tick(h.ctx, 0.0);
   EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
 }
@@ -126,34 +126,16 @@ TEST(DecisionFsm, ResupplyWhenHpLow)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(140, 50));
+  h.ctx.update(robot(140, FULL_AMMO));  // hp < hp_low
   h.fsm.tick(h.ctx, 0.0);
   EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
-}
-
-TEST(DecisionFsm, RetreatWhenHpCritical)
-{
-  Harness h{make_profile()};
-  h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(40, 50));
-  h.fsm.tick(h.ctx, 0.0);
-  EXPECT_EQ(h.fsm.state(), State::RETREAT);
-}
-
-TEST(DecisionFsm, CriticalHpBeatsResupply)
-{
-  Harness h{make_profile()};
-  h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(30, 0));  // critical + empty ammo → RETREAT wins
-  h.fsm.tick(h.ctx, 0.0);
-  EXPECT_EQ(h.fsm.state(), State::RETREAT);
 }
 
 TEST(DecisionFsm, GameEndForcesIdle)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::PATROL);
   h.ctx.update(game(rm_interfaces::msg::GameStatus::GAME_OVER, 0));
@@ -166,7 +148,7 @@ TEST(DecisionFsm, RefereeStaleForcesIdle)
   Harness h{make_profile()};
   h.ctx.set_now(0.0);
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::PATROL);
   h.ctx.set_now(4.0);
@@ -182,7 +164,7 @@ TEST(DecisionFsm, PatrolSendsFirstWaypoint)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::PATROL);
   ASSERT_EQ(h.goals.size(), 1u);
@@ -194,7 +176,7 @@ TEST(DecisionFsm, PatrolAdvancesAfterArrivalAndDwell)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   h.ctx.set_nav_status(NavStatus::ARRIVED);
   h.fsm.tick(h.ctx, 1.0);
@@ -209,7 +191,7 @@ TEST(DecisionFsm, PatrolDoesNotAdvanceBeforeArrival)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   h.fsm.tick(h.ctx, 100.0);  // stuck timeout triggers skip
   EXPECT_EQ(h.goals.size(), 1u);
@@ -219,7 +201,7 @@ TEST(DecisionFsm, NavStuckAdvancesPatrol)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::PATROL);
   const auto first = h.goals.back();
@@ -241,7 +223,7 @@ TEST(DecisionFsm, PatrolUsesAggressiveRouteWhenOutpostAlive)
   p.patrol_aggressive = {{8.0, 0.0, 5.0}};
   Harness h{std::move(p)};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.ctx.update(outpost_hp(500));  // outpost alive
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::PATROL);
@@ -249,187 +231,223 @@ TEST(DecisionFsm, PatrolUsesAggressiveRouteWhenOutpostAlive)
   EXPECT_DOUBLE_EQ(h.goals[0].x, 8.0);
 }
 
-TEST(DecisionFsm, PatrolUsesLateRouteInLastMinute)
+TEST(DecisionFsm, PatrolFallsBackToDefaultWhenOutpostDestroyed)
 {
+  // Outpost destroyed → must use default patrol (我方半场防守), not aggressive.
   Profile p = make_profile();
-  p.patrol_late = {{2.0, 1.0, 5.0}};
+  p.patrol = {{1.0, 1.0, 5.0}};
+  p.patrol_aggressive = {{8.0, 0.0, 5.0}};
   Harness h{std::move(p)};
-  h.ctx.update(game(RUNNING, 30));  // < 60 s
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
+  h.ctx.update(outpost_hp(0));  // outpost destroyed
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::PATROL);
   ASSERT_FALSE(h.goals.empty());
-  EXPECT_DOUBLE_EQ(h.goals[0].x, 2.0);
+  EXPECT_DOUBLE_EQ(h.goals[0].x, 1.0);  // default route
 }
 
-// =============================================================================
-//  Resupply
-// =============================================================================
-
-TEST(DecisionFsm, ResupplyExitAtFullHp)
+TEST(DecisionFsm, PatrolResetsTrackingOnRouteSwitch)
 {
-  Harness h{make_profile()};
+  // Switching aggressive → default must reset path_idx_/goal_sent_ so we
+  // republish from the new route's start instead of chasing a stale goal.
+  Profile p = make_profile();
+  p.patrol = {{1.0, 1.0, 5.0}, {2.0, 2.0, 5.0}, {3.0, 3.0, 5.0}};
+  p.patrol_aggressive = {{8.0, 0.0, 5.0}};
+  Harness h{std::move(p)};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(140, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
+  h.ctx.update(outpost_hp(500));  // outpost alive → aggressive
   h.fsm.tick(h.ctx, 0.0);
-  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
-  h.ctx.update(robot(400, 50));  // full hp + ammo
+  ASSERT_FALSE(h.goals.empty());
+  EXPECT_DOUBLE_EQ(h.goals.back().x, 8.0);  // aggressive point
+
+  // outpost destroyed → switch to default; must republish from default[0]
+  h.ctx.update(outpost_hp(0));
+  h.ctx.set_nav_status(NavStatus::MOVING);
   h.fsm.tick(h.ctx, 1.0);
-  EXPECT_NE(h.fsm.state(), State::RESUPPLY);
+  EXPECT_DOUBLE_EQ(h.goals.back().x, 1.0)
+      << "route switch must reset tracking and republish from new route start";
 }
 
-TEST(DecisionFsm, ResupplyStaysWithAmmoEmpty)
+// =============================================================================
+//  Resupply — enter / exit hysteresis
+// =============================================================================
+
+TEST(DecisionFsm, ResupplyExitsOnlyWhenFullyRecovered)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 0));  // ammo=0, hp full
+  h.ctx.update(robot(140, FULL_AMMO));  // hp low → enter
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
-  // hp recovers but ammo still 0
-  h.ctx.update(robot(400, 0));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));  // hp == max AND ammo ok
+  h.fsm.tick(h.ctx, 1.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
+}
+
+TEST(DecisionFsm, ResupplyStaysUntilHpFull)
+{
+  // hp recovered above hp_low but not yet full → must stay
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(140, FULL_AMMO));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  h.ctx.update(robot(399, FULL_AMMO));  // one below max → still healing
   h.fsm.tick(h.ctx, 1.0);
   EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
 }
 
-TEST(DecisionFsm, BackupSupplyPublishedAfterTimeout)
+TEST(DecisionFsm, ResupplyStaysUntilAmmoOk)
 {
-  Profile p = make_profile();
-  p.backup_supply_points = {{-3.0, -5.0, 0.0}};
-  Harness h{std::move(p)};
+  // hp full but ammo still below ammo_ok → must stay (waiting for +100/min)
+  Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(140, 50));
-  h.fsm.tick(h.ctx, 0.0);
-  ASSERT_EQ(h.goals.size(), 1u);
-  h.fsm.tick(h.ctx, 31.0);  // > resupply_timeout_s (30)
-  ASSERT_EQ(h.goals.size(), 2u);
-  EXPECT_DOUBLE_EQ(h.goals[1].x, -3.0);
-}
-
-TEST(DecisionFsm, ResupplyDoesNotOscillate)
-{
-  // After supply exhaustion, RESUPPLY should not be re-entered during cooldown
-  Profile p = make_profile();
-  p.thresholds.supply_retry_cooldown_s = 15.0;
-  p.thresholds.resupply_timeout_s = 1.0;  // fast exhaustion
-  Harness h{std::move(p)};
-  h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(140, 50));
+  h.ctx.update(robot(FULL_HP, 40));  // ammo low → enter
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
-  h.fsm.tick(h.ctx, 2.0);  // timeout → exhausted
-  //  supply_backup_exhausted_ now true, hp 140 < 120? no, so can leave
-  // Actually hp(140) >= hp_critical_exit(120), so RESUPPLY releases
-  // Next tick: needs_resupply (140 < 150), but in_cooldown → skip → PATROL
-  h.fsm.tick(h.ctx, 3.0);
+  h.ctx.update(robot(FULL_HP, 99));  // ammo below ammo_ok(100)
+  h.fsm.tick(h.ctx, 1.0);
+  EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
+  h.ctx.update(robot(FULL_HP, 100));  // ammo == ammo_ok → leave
+  h.fsm.tick(h.ctx, 2.0);
   EXPECT_EQ(h.fsm.state(), State::PATROL);
 }
 
-TEST(DecisionFsm, ResupplyStaysAfterCooldownRetry)
-{
-  // After cooldown expires, re-entering RESUPPLY must get a full fresh
-  // attempt — not bail to PATROL because of a stale exhausted flag.
-  Profile p = make_profile();
-  p.thresholds.supply_retry_cooldown_s = 15.0;
-  p.thresholds.resupply_timeout_s = 1.0;   // fast exhaustion
-  Harness h{std::move(p)};
-  h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(140, 50));
-
-  // exhaust supply over several ticks
-  h.fsm.tick(h.ctx, 0.0);
-  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
-  h.fsm.tick(h.ctx, 2.0);   // behave_resupply sets exhausted=true this tick
-                             // but select_state ran first → still RESUPPLY
-  h.fsm.tick(h.ctx, 3.0);   // select_state now sees exhausted=true → PATROL
-  ASSERT_EQ(h.fsm.state(), State::PATROL);
-
-  // cooldown expired, hp still 140 (in the [120,150) gap)
-  h.fsm.tick(h.ctx, 20.0);  // 20-2=18 > 15s cooldown → re-enter RESUPPLY
-  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
-
-  // THE KEY CHECK: next tick must stay RESUPPLY, not bail to PATROL
-  h.fsm.tick(h.ctx, 21.0);
-  EXPECT_EQ(h.fsm.state(), State::RESUPPLY)
-      << "supply_backup_exhausted_ must be cleared on re-entry; "
-         "otherwise the FSM sees a fresh enter but a stale exhausted flag "
-         "and kicks itself back to PATROL after a single tick";
-}
-
-// =============================================================================
-//  Retreat
-// =============================================================================
-
-TEST(DecisionFsm, RetreatGoesToSupply)
+TEST(DecisionFsm, ResupplySendsGoalToSupplyPad)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(40, 50));
+  h.ctx.update(robot(140, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
-  ASSERT_EQ(h.fsm.state(), State::RETREAT);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
   ASSERT_FALSE(h.goals.empty());
   EXPECT_DOUBLE_EQ(h.goals[0].x, -1.0);
   EXPECT_DOUBLE_EQ(h.goals[0].y, -5.0);
 }
 
-TEST(DecisionFsm, RetreatRetriesSupplyOnTimeout)
+TEST(DecisionFsm, BackupSupplyRotatedAfterTimeout)
 {
   Profile p = make_profile();
-  p.supply = {-1.0, -5.0, 0.0};
-  p.thresholds.retreat_timeout_s = 1.0;
+  p.backup_supply_points = {{-3.0, -5.0, 0.0}};
   Harness h{std::move(p)};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(40, 50));
+  h.ctx.update(robot(140, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.goals.size(), 1u);
-  EXPECT_DOUBLE_EQ(h.goals[0].x, -1.0);  // supply
-  h.fsm.tick(h.ctx, 2.0);                // timeout → retry
+  EXPECT_DOUBLE_EQ(h.goals[0].x, -1.0);   // primary
+  h.fsm.tick(h.ctx, 31.0);  // > resupply_timeout_s (30) → rotate
   ASSERT_EQ(h.goals.size(), 2u);
-  EXPECT_DOUBLE_EQ(h.goals[1].x, -1.0);  // supply again
+  EXPECT_DOUBLE_EQ(h.goals[1].x, -3.0);   // backup
 }
 
-TEST(DecisionFsm, RetreatHysteresis)
+TEST(DecisionFsm, SupplyTargetCyclesBackToPrimary)
 {
-  // Enter RETREAT at hp=59, leave at hp >= 120
-  Harness h{make_profile()};
+  // With one backup, rotation must cycle: primary → backup → primary → …
+  // proving the sentry never permanently gives up on a supply point.
+  Profile p = make_profile();
+  p.backup_supply_points = {{-3.0, -5.0, 0.0}};
+  p.thresholds.resupply_timeout_s = 1.0;
+  Harness h{std::move(p)};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(59, 50));
+  h.ctx.update(robot(140, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
-  ASSERT_EQ(h.fsm.state(), State::RETREAT);
-  h.ctx.update(robot(100, 50));  // recovered but still below exit
-  h.fsm.tick(h.ctx, 1.0);
-  EXPECT_EQ(h.fsm.state(), State::RETREAT);
-  h.ctx.update(robot(120, 50));  // now above exit
+  ASSERT_EQ(h.goals.size(), 1u);
+  EXPECT_DOUBLE_EQ(h.goals[0].x, -1.0);   // primary
   h.fsm.tick(h.ctx, 2.0);
-  EXPECT_NE(h.fsm.state(), State::RETREAT);
+  EXPECT_DOUBLE_EQ(h.goals.back().x, -3.0);   // backup
+  h.fsm.tick(h.ctx, 4.0);
+  EXPECT_DOUBLE_EQ(h.goals.back().x, -1.0);   // back to primary
+}
+
+TEST(DecisionFsm, ResupplyRotatesImmediatelyOnNavFail)
+{
+  Profile p = make_profile();
+  p.backup_supply_points = {{-3.0, -5.0, 0.0}};
+  Harness h{std::move(p)};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(140, FULL_AMMO));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.goals.size(), 1u);
+  h.ctx.set_nav_status(NavStatus::FAILED);
+  h.fsm.tick(h.ctx, 1.0);
+  ASSERT_EQ(h.goals.size(), 2u);
+  EXPECT_DOUBLE_EQ(h.goals[1].x, -3.0);
+}
+
+// =============================================================================
+//  Respawn — sentry must keep heading home after reviving (never gives up)
+// =============================================================================
+
+TEST(DecisionFsm, RespawnKeepsNavigatingHome)
+{
+  // Sentry dies (hp 0) mid-match, stays "dead" far longer than any old
+  // timeout cap, then revives. It must still be in RESUPPLY and still be
+  // publishing goals to the supply pad — never stalled.
+  // Referee data streams continuously, so we refresh it at every time step
+  // (otherwise referee_fresh() would go stale and force IDLE).
+  auto step = [](Harness & h, double t, uint16_t hp) {
+    h.ctx.set_now(t);
+    h.ctx.update(game(RUNNING, 300));
+    h.ctx.update(robot(hp, FULL_AMMO));
+    h.fsm.tick(h.ctx, t);
+  };
+
+  Harness h{make_profile()};
+  step(h, 0.0, 0);   // dead
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  const std::size_t goals_before = h.goals.size();
+
+  // long "dead" period — well past the removed 60/120 s caps
+  step(h, 200.0, 0);
+
+  // revive with low hp (respawn restores 10% → still below hp_low)
+  step(h, 201.0, 40);
+  EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
+
+  // stuck timeout should still rotate/republish → new goals keep coming
+  step(h, 240.0, 40);
+  EXPECT_GT(h.goals.size(), goals_before)
+      << "sentry must keep publishing supply goals after respawn, not stall";
 }
 
 // =============================================================================
 //  Boundary cases
 // =============================================================================
 
-TEST(DecisionFsm, HpBoundaryNotEnterRetreat)
+TEST(DecisionFsm, HpBoundaryNotEnterResupply)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(60, 50));  // == hp_critical (not <)
+  h.ctx.update(robot(150, FULL_AMMO));  // == hp_low (not <)
   h.fsm.tick(h.ctx, 0.0);
-  EXPECT_NE(h.fsm.state(), State::RETREAT);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
 }
 
-TEST(DecisionFsm, HpBoundaryEnterRetreat)
+TEST(DecisionFsm, HpBoundaryEnterResupply)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(59, 50));  // < hp_critical
+  h.ctx.update(robot(149, FULL_AMMO));  // < hp_low
   h.fsm.tick(h.ctx, 0.0);
-  EXPECT_EQ(h.fsm.state(), State::RETREAT);
+  EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
+}
+
+TEST(DecisionFsm, AmmoBoundaryEnterResupply)
+{
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(FULL_HP, 51));  // > ammo_low → still patrol
+  h.fsm.tick(h.ctx, 0.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
 }
 
 TEST(DecisionFsm, IdleCancelsNavigation)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_FALSE(h.nav_cancelled);
   h.ctx.update(game(rm_interfaces::msg::GameStatus::PREPARATION, 400));
@@ -441,10 +459,10 @@ TEST(DecisionFsm, MidPatrolHpDropGoesResupply)
 {
   Harness h{make_profile()};
   h.ctx.update(game(RUNNING, 300));
-  h.ctx.update(robot(400, 50));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
   h.fsm.tick(h.ctx, 0.0);
   ASSERT_EQ(h.fsm.state(), State::PATROL);
-  h.ctx.update(robot(140, 50));  // hp drops below hp_low
+  h.ctx.update(robot(140, FULL_AMMO));  // hp drops below hp_low
   h.fsm.tick(h.ctx, 1.0);
   EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
 }

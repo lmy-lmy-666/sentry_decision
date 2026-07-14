@@ -1,6 +1,6 @@
 # sentry_decision_sample — 哨兵导航调度器
 
-> 最后更新: 2026-07-09 | 目标机器人: 哨兵 (Sentry) | 赛季: RM2026
+> 最后更新: 2026-07-14 | 目标机器人: 全自动哨兵 (Sentry) | 赛季: RM2026
 
 ---
 
@@ -8,7 +8,7 @@
 
 `sentry_decision_sample` 是一个**纯导航调度器**。它只回答一个问题：**哨兵下一步往哪走。**
 
-它不参与战斗（自瞄独立运作），不控制姿态（电控负责），不感知敌人。它只从裁判系统读取血量和弹药，然后决定去巡逻、去补给、还是撤退。
+它不参与战斗（自瞄独立运作），不控制姿态（电控负责），不感知敌人。它只从裁判系统读取血量、弹药和前哨站状态，然后决定去巡逻还是回补给区。目标机器人是**全自动哨兵**（满血 400），弹药兑换/复活确认/姿态切换等全部交给电控，本模块只回答"下一步往哪走"。
 
 ### 与原版 `sentry_decision` 的关系
 
@@ -21,11 +21,12 @@
 
 | 决策模块做 | 决策模块不做 |
 |-----------|-------------|
-| 血量低→去补给区 | 看到敌人→追击（自瞄独立） |
-| 弹药空→去补给区 | 被攻击→反击（电控+自瞄） |
-| 致命血量→回补给区 | 切换进攻/防御姿态（电控） |
-| 有血有弹→巡逻 | 判断该不该开火（自瞄） |
-| 前哨存活→激进巡逻路线 | 接收雷达/自瞄数据 |
+| 血量低(hp<150)→去补给区 | 看到敌人→追击（自瞄独立） |
+| 弹药低(≤50)→去补给区 | 被攻击→反击（电控+自瞄） |
+| 补满(hp满且弹药≥100)→出去巡逻 | 主动兑换弹药 / 确认复活（电控） |
+| 有血有弹→巡逻 | 切换进攻/防御姿态（电控） |
+| 前哨存活→前压路线 / 前哨亡→半场防守 | 判断该不该开火（自瞄） |
+| 阵亡复活后持续导航回补给区 | 接收雷达/自瞄数据 |
 
 ---
 
@@ -60,19 +61,21 @@
 优先级从高到低：
 
 ① IDLE      ← 裁判数据失效（超过 3 秒）或比赛未运行
-② RETREAT   ← hp < 60。已在 RETREAT 则 hp < 120 才保持（hysteresis）
-③ RESUPPLY  ← 已在补给中且仍需补。弹药空时不退出。
-              ├─ 补给耗尽 & hp ≥ 120 → 退出
-              └─ 未耗尽 & (弹药空 or hp < max_hp) → 保持
-④ RESUPPLY  ← 弹药空 or hp < 150。冷却期 15s 内不重试（弹药空绕过）
-⑤ PATROL    ← 以上都不满足时的默认状态
+② RESUPPLY  ← 已在补给中且未恢复满 → 保持
+              退出条件：hp 回满 400 且 ammo ≥ 100（两者都满足才出）
+③ RESUPPLY  ← hp < 150 或 ammo ≤ 50 → 进入
+④ PATROL    ← 以上都不满足时的默认状态
 ```
+
+**迟滞设计**：进入用 `hp<150 / ammo≤50`，退出用 `hp满 / ammo≥100`，进出阈值分离防止边界抖动。弹药靠补给区每分钟被动 +100 恢复，一个免费周期即可从 50 补过 100。
+
+**复活兜底**：哨兵阵亡时 `hp=0`，会留在 RESUPPLY；复活后（hp 从 0 恢复但仍 <150）继续保持 RESUPPLY 并持续导航回补给区，直到恢复满。这是"永不放弃"设计的直接结果。
 
 ### 4.2 状态切换防振荡 (can_leave_current_state)
 
 - IDLE 可以随时离开
-- 进入 IDLE / RETREAT 总是允许（安全优先）
-- RESUPPLY 可以抢断除 RETREAT 外的任何状态
+- 进入 IDLE 总是允许
+- RESUPPLY 可以立即抢断 PATROL（血/弹不足优先）
 - 其他状态间切换需要 `min_ticks_in_state`（默认 4 ticks = 400ms）
 
 ### 4.3 状态行为
@@ -80,9 +83,8 @@
 | 状态 | 导航目标 | 说明 |
 |------|---------|------|
 | IDLE | 无（取消所有导航） | 裁判断连或比赛未运行时原地等待 |
-| PATROL | `patrol` 路线循环 | 前哨存活自动切 `patrol_aggressive`，最后 60 秒自动切 `patrol_late` |
-| RESUPPLY | `supply` → `backup_supply_points[N]` | RFID 滑动窗口确认到达后停留回血，满血满弹后离开 |
-| RETREAT | `supply`（重试直到总超时） | 致命血量时直接回补给区。补给区在己方基地（敌方禁区），永远可达 |
+| PATROL | `patrol` / `patrol_aggressive` 路线循环 | 前哨站存活走 `patrol_aggressive`（前压），被打掉走 `patrol`（我方半场防守）。路线切换时重置路点追踪 |
+| RESUPPLY | `supply`（+ 可选 `backup_supply_points` 轮换） | RFID 滑动窗口确认到达后停留恢复；未到达则持续导航，卡住/超时就轮换候选点再回主点，**永不放弃**。满血且弹药≥100 后离开 |
 
 ---
 
@@ -93,15 +95,15 @@ sentry_decision_sample/
 ├── CMakeLists.txt
 ├── package.xml
 ├── include/sentry_decision_sample/
-│   ├── types.hpp          # 枚举、结构体、阈值（77 行）
-│   ├── context.hpp        # Context: 比赛状态聚合器（180 行）
-│   ├── profile.hpp        # Profile: YAML 加载（38 行）
-│   ├── fsm.hpp            # DecisionFsm: 状态机声明（90 行）
-│   └── decision_node.hpp  # DecisionNode: ROS2 节点声明（82 行）
+│   ├── types.hpp          # 枚举、结构体、阈值
+│   ├── context.hpp        # Context: 比赛状态聚合器
+│   ├── profile.hpp        # Profile: YAML 加载
+│   ├── fsm.hpp            # DecisionFsm: 状态机声明
+│   └── decision_node.hpp  # DecisionNode: ROS2 节点声明
 ├── src/
-│   ├── profile.cpp        # YAML 解析（95 行）
-│   ├── fsm.cpp            # FSM 实现（364 行）
-│   └── decision_node.cpp  # 节点: 订阅、action client、fallback（270 行）
+│   ├── profile.cpp        # YAML 解析
+│   ├── fsm.cpp            # FSM 实现
+│   └── decision_node.cpp  # 节点: 订阅、action client、fallback
 ├── config/profiles/
 │   ├── rmuc_red.yaml / rmuc_blue.yaml
 ├── launch/
@@ -130,15 +132,15 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 |------|------|
 | `Waypoint {x, y, dwell_s}` | 导航目标点 |
 | `Route = vector<Waypoint>` | 路点序列 |
-| `State` (enum) | IDLE / PATROL / RESUPPLY / RETREAT |
+| `State` (enum) | IDLE / PATROL / RESUPPLY |
 | `NavStatus` (enum) | IDLE / MOVING / ARRIVED / FAILED |
-| `Thresholds` | 14 个可配置阈值，全部有默认值 |
+| `Thresholds` | 8 个可配置阈值，全部有默认值 |
 
 ### 5.3 context.hpp — 世界模型
 
 无 ROS 依赖，纯 C++ 数据聚合。关键方法：
 
-**裁判相关**：`game_running()`, `remain_time()`, `late_game()`, `referee_fresh()`, `hp()`, `max_hp()`, `hp_critical()`, `hp_low()`, `ammo()`, `ammo_empty()`, `needs_resupply()`
+**裁判相关**：`game_running()`, `remain_time()`, `referee_fresh()`, `hp()`, `max_hp()`, `hp_low()`, `hp_full()`, `ammo()`, `ammo_low()`, `ammo_ok()`, `needs_resupply()`, `resupply_done()`
 
 **场地相关**：`on_supply_pad()`, `outpost_alive()`, `ally_base_hp()`
 
@@ -149,10 +151,9 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 ### 5.4 fsm.cpp — 核心 FSM
 
 - **tick()**：select_state → can_leave_current_state → on_exit/on_enter → run_behaviour
-- **select_state()**：5 级优先级链，每 tick 重评估
-- **behave_patrol()**：巡逻路线循环，前哨存活/比赛后期自动切换战术路线
-- **behave_resupply()**：RFID 滑动窗口防抖 → 总超时 → nav_failed 跳备用 → 单点超时 → 耗尽冷却
-- **behave_retreat()**：持续导航到补给区，总超时兜底，卡住重试（Nav2 重新规划路径）
+- **select_state()**：3 级优先级链（IDLE / RESUPPLY / PATROL），每 tick 重评估
+- **behave_patrol()**：按前哨站状态二选一路线（存活前压 / 被打掉半场防守），路线切换时重置路点追踪，卡住跳点
+- **behave_resupply()**：RFID 滑动窗口防抖确认到达 → 未到达则持续导航；nav_failed 或单点超时轮换候选点（主点↔备用点循环），**永不放弃**，天然覆盖复活回归
 
 ---
 
@@ -160,20 +161,18 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 
 ### 6.1 防振荡
 
-- **RETREAT hysteresis**：进入 hp<60，退出 hp≥120（60HP 窗口）
-- **RESUPPLY 冷却**：补给全部失败后 15s 不重试（弹药空绕过），防止 PATROL↔RESUPPLY 死循环
-- **min_ticks_in_state**：非安全状态切换需停留 4 tick（400ms），防止瞬态抖动
-- **RESUPPLY→RETREAT 直通**：安全优先，从补给状态可直接切入撤退
+- **HP/弹药迟滞**：进入 hp<150 或 ammo≤50，退出需 hp满且 ammo≥100，进出阈值分离防边界抖动
+- **min_ticks_in_state**：PATROL 切换需停留 4 tick（400ms），防止瞬态抖动（RESUPPLY 抢断不受限，血/弹优先）
+- **路线切换重置**：巡逻路线切换时重置 `path_idx_`/`goal_sent_`，避免拿新路线索引判断旧目标的到达/超时
 
 ### 6.2 超时安全网
 
 | 超时 | 默认值 | 作用 |
 |------|--------|------|
-| `stuck_timeout_s` | 30s | 单个巡逻点超时→跳过 |
-| `resupply_timeout_s` | 30s | 单个补给点超时→切备用 |
-| `resupply_total_timeout_s` | 120s | 整条补给链超时→耗尽冷却 |
-| `retreat_timeout_s` | 30s | 撤退单次超时→重试 |
-| `retreat_total_timeout_s` | 60s | 整次撤退超时→原地停留 |
+| `stuck_timeout_s` | 10s | 单个巡逻点超时→跳过下一个点 |
+| `resupply_timeout_s` | 30s | 单个补给点超时→轮换到下一候选点（循环，不放弃） |
+
+> 注：旧版的"总超时后原地放弃"逻辑已移除。RESUPPLY 只要未恢复满就持续导航，确保阵亡复活后一定能回补给区。
 
 ### 6.3 数据安全
 
@@ -197,19 +196,14 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `hp_low` | 150 | 低血量阈值（低于此值去补给） |
-| `hp_critical` | 60 | 致命血量阈值（低于此值撤退） |
-| `hp_critical_exit` | 120 | 撤退退出滞后值 |
-| `ammo_min` | 1 | 弹药耗尽阈值 |
+| `hp_low` | 150 | 血量低于此值 → 进 RESUPPLY |
+| `ammo_low` | 50 | 弹药 ≤ 此值 → 进 RESUPPLY |
+| `ammo_ok` | 100 | 弹药 ≥ 此值（且血满）→ 退出 RESUPPLY |
 | `game_total_time` | 420 | 比赛总时长（秒） |
 | `min_ticks_in_state` | 4 | 状态最小停留 tick |
-| `stuck_timeout_s` | 30.0 | 路点卡住超时（秒） |
-| `resupply_timeout_s` | 30.0 | 单个补给点超时（秒） |
-| `resupply_total_timeout_s` | 120.0 | 补给链总超时（秒） |
-| `retreat_timeout_s` | 30.0 | 撤退单点超时（秒） |
-| `retreat_total_timeout_s` | 60.0 | 撤退总超时（秒） |
+| `stuck_timeout_s` | 10.0 | 路点卡住超时（秒） |
+| `resupply_timeout_s` | 30.0 | 单个补给点超时→轮换（秒） |
 | `referee_stale_timeout_s` | 3.0 | 裁判数据过期时间（秒） |
-| `supply_retry_cooldown_s` | 15.0 | 补给失败后冷却时间（秒） |
 
 ### ROS2 参数
 
@@ -226,15 +220,18 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 
 ## 8. Patrol 战术路线切换规则
 
-PATROL 状态每 tick 自动选择巡逻路线，优先级如下：
+PATROL 状态每 tick 按**我方前哨站状态**二选一：
 
 ```
-① late_game（剩余 < 60s）且 patrol_late 非空 → 使用 patrol_late
-② outpost_alive（前哨站存活）且 patrol_aggressive 非空 → 使用 patrol_aggressive
-③ 以上都不满足 → 使用默认 patrol
+① outpost_alive（前哨站存活）且 patrol_aggressive 非空 → patrol_aggressive（前压）
+② 否则（前哨站被打掉，或未配激进路线）              → patrol（我方半场防守）
 ```
 
-换战术只需修改 YAML，无需重新编译。
+依据：前哨站存活时己方基地无敌，可放心前压；前哨站被击毁后基地暴露，退回半场防守。
+
+路线切换时会重置路点追踪（`path_idx_`/`goal_sent_`/`goal_arrived_`），从新路线起点重新发目标，避免追错航点。换战术只需修改 YAML，无需重新编译。
+
+> **末局决策未实现**：规则上"双方前哨站均被摧毁 + 基地血量胶着"时靠全队总伤害定胜负，此时该攻该守取决于**敌我基地血量对比**。但当前 `GameRobotHP.msg` 只解析了己方字段（`enemy_base_hp`/`enemy_outpost_hp`/`damage_difference` 未接入），读不到敌方数据，故末局专用逻辑暂不实现，等上游串口驱动补全敌方字段后再做。
 
 ---
 
@@ -254,11 +251,11 @@ colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_T
 
 # 红方
 ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
-  -p profile_path:=~/omni_navigation/src/sentry_decision_sample/config/profiles/rmuc_red.yaml
+  -p profile_path:=~/omni_navigation/src/omni_decision_sample/config/profiles/rmuc_red.yaml
 
 # 蓝方
 ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
-  -p profile_path:=~/omni_navigation/src/sentry_decision_sample/config/profiles/rmuc_blue.yaml
+  -p profile_path:=~/omni_navigation/src/omni_decision_sample/config/profiles/rmuc_blue.yaml
 ```
 
 ---
@@ -267,12 +264,13 @@ ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
 
 | 项目 | 状态 |
 |------|------|
-| 代码行数 | ~950 行 |
+| 状态机 | 3 态（IDLE / PATROL / RESUPPLY） |
 | 单元测试 | 26/26 通过 |
 | 编译警告 | 0 |
 | 死代码 | 0 |
 | 已知逻辑缺陷 | 0 |
-| 待验证 | Profile 中的坐标需在实车场地确认 |
+| 待验证 | Profile 中的坐标需在实车场地标定确认 |
+| 未实现（有意） | 末局攻守决策（依赖敌方基地血量，当前链路读不到） |
 
 ---
 

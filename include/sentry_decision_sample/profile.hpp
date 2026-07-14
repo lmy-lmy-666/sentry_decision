@@ -20,11 +20,11 @@ struct Profile
 
   // --- mandatory waypoints ---------------------------------------
   Route  patrol;             ///< default patrol loop
-  Waypoint supply;           ///< supply pad — also the sole retreat destination
+  Waypoint supply;           ///< supply pad — the sole recovery destination (heal + refill)
 
-  // --- optional tactical variants (selected at runtime) ----------
-  Route patrol_aggressive;   ///< used when outpost is alive (前哨存活激进巡逻)
-  Route patrol_late;         ///< used in last 60 s (后期保守巡逻)
+  // --- optional tactical variant (selected at runtime) ----------
+  Route patrol_aggressive;   ///< used while our outpost is alive (前哨存活激进前压)
+                             ///< when outpost is destroyed → fall back to `patrol` (我方半场防守)
 
   // --- fallback chains -------------------------------------------
   std::vector<Waypoint> backup_supply_points;

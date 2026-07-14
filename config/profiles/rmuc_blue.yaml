@@ -3,32 +3,41 @@
 name: rmuc_blue
 
 thresholds:
-  hp_low: 150
-  hp_critical: 60
-  hp_critical_exit: 120
-  ammo_min: 1
+  hp_low: 150            # enter RESUPPLY below this hp
+  ammo_low: 50           # enter RESUPPLY at/below this ammo
+  ammo_ok: 100           # leave RESUPPLY at/above this ammo (one free +100/min cycle)
   game_total_time: 420
   min_ticks_in_state: 4
-  stuck_timeout_s: 30.0
-  resupply_timeout_s: 30.0
-  resupply_total_timeout_s: 120.0
-  retreat_timeout_s: 30.0
-  retreat_total_timeout_s: 60.0
+  stuck_timeout_s: 10.0      # per-waypoint patrol timeout → skip to next
+  resupply_timeout_s: 30.0   # single supply-point timeout → rotate to next (never gives up)
   referee_stale_timeout_s: 3.0
-  supply_retry_cooldown_s: 15.0
 
+# =============================================================================
+# ⚠️  坐标标定清单 (TODO: 上场前必须用实车在比赛地图逐点标定)
+# =============================================================================
+# 下面所有 x/y 均为【占位符】，未经实车验证。标定方法：
+#   1. 启动定位栈，把哨兵手动推到目标位置
+#   2. ros2 topic echo <odom话题> --once  读取 pose.pose.position 的 x/y
+#   3. 填入下方对应字段
+# 坐标系 = map (与 goal_frame 参数一致)。共需标定 5 个位置：
+#   [ ] patrol[0]           默认巡逻点1
+#   [ ] patrol[1]           默认巡逻点2
+#   [ ] patrol[2]           默认巡逻点3
+#   [ ] patrol_aggressive   前压点
+#   [ ] supply              补给点 (★最关键，必须验证可达)
+# =============================================================================
+
+# --- default patrol loop (used when our outpost is destroyed → 我方半场防守) ---
 patrol:
-  - {x: -3.88, y: 2.67, dwell_s: 10.0}
-  - {x: -4.24, y: -2.54, dwell_s: 15.0}
-  - {x: -3.85, y: 2.58, dwell_s: 10.0}
+  - {x: -3.88, y: 2.67, dwell_s: 10.0}   # TODO 实车标定
+  - {x: -4.24, y: -2.54, dwell_s: 15.0}  # TODO 实车标定
+  - {x: -3.85, y: 2.58, dwell_s: 10.0}   # TODO 实车标定
 
+# --- aggressive patrol while our outpost is alive (前压) ---
 patrol_aggressive:
-  - {x: -8.0, y: 0.0, dwell_s: 10.0}
+  - {x: -8.0, y: 0.0, dwell_s: 10.0}     # TODO 实车标定
 
-patrol_late:
-  - {x: -2.0, y: 1.5, dwell_s: 10.0}
-  - {x: -2.0, y: -1.5, dwell_s: 10.0}
-
-supply: {x: 1.02, y: -4.91}
+# ★ 补给点 = 唯一恢复点 + 阵亡复活回归点，务必验证 Nav2 能规划到达
+supply: {x: 1.02, y: -4.91}              # TODO 实车标定 (最关键)
 
 backup_supply_points: []

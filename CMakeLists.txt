@@ -40,6 +40,13 @@ install(TARGETS sentry_decision_sample_lib
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
+# python helper scripts (mock referee + preflight check)
+install(PROGRAMS
+  scripts/mock_referee.py
+  scripts/preflight_check.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 # ---- tests ---------------------------------------------------
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

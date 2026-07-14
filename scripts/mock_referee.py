@@ -4,8 +4,8 @@ Mock referee publisher — 模拟裁判系统数据，方便实车测试"残血�
 
 用法：
   ros2 run sentry_decision_sample mock_referee.py --ros-args \
-    -p hp:=100 \          # 初始血量
-    -p ammo:=50 \         # 初始弹药
+    -p hp:=400 \          # 初始血量
+    -p ammo:=300 \        # 初始弹药 (>50 才是 PATROL, ≤50 会进 RESUPPLY)
     -p max_hp:=400 \      # 最大血量
     -p remain:=300        # 剩余时间
 
@@ -24,7 +24,7 @@ class MockReferee(Node):
         super().__init__("mock_referee")
 
         self.declare_parameter("hp", 400)
-        self.declare_parameter("ammo", 50)
+        self.declare_parameter("ammo", 300)   # >50 so default state is PATROL, not RESUPPLY
         self.declare_parameter("max_hp", 400)
         self.declare_parameter("remain", 300)
 

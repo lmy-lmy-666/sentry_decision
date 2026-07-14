@@ -77,7 +77,6 @@ public:
   }
 
   int32_t remain_time() const { return game_status_ ? game_status_->stage_remain_time : -1; }
-  bool late_game() const { return remain_time() >= 0 && remain_time() < 60; }
 
   // ========================================================================
   //  hp / ammo
@@ -85,13 +84,18 @@ public:
 
   uint16_t hp() const { return robot_status_ ? robot_status_->current_hp : 0; }
   uint16_t max_hp() const { return robot_status_ ? robot_status_->maximum_hp : 400; }
-  bool hp_critical() const { return robot_status_ && robot_status_->current_hp < thresholds_.hp_critical; }
   bool hp_low() const { return robot_status_ && robot_status_->current_hp < thresholds_.hp_low; }
+  bool hp_full() const { return robot_status_ && robot_status_->current_hp >= robot_status_->maximum_hp; }
 
   uint16_t ammo() const { return robot_status_ ? robot_status_->projectile_allowance_17mm : 0; }
-  bool ammo_empty() const { return robot_status_ && robot_status_->projectile_allowance_17mm <= thresholds_.ammo_min; }
+  bool ammo_low() const { return robot_status_ && robot_status_->projectile_allowance_17mm <= thresholds_.ammo_low; }
+  bool ammo_ok() const { return robot_status_ && robot_status_->projectile_allowance_17mm >= thresholds_.ammo_ok; }
 
-  bool needs_resupply() const { return ammo_empty() || hp_low(); }
+  /// Enter RESUPPLY: low hp or low ammo.
+  bool needs_resupply() const { return hp_low() || ammo_low(); }
+
+  /// Leave RESUPPLY: fully healed AND ammo replenished past ammo_ok.
+  bool resupply_done() const { return hp_full() && ammo_ok(); }
 
   // ========================================================================
   //  RFID / field zones

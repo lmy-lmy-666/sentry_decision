@@ -1,12 +1,14 @@
 // Copyright 2026 Boombroke
 //
-// Simplified FSM — 4 states, navigation-only.
+// Simplified FSM — 3 states, navigation-only.
 //
 // Priority chain (evaluated every tick, first match wins):
 //   ① IDLE      — referee offline or game not running
-//   ② RETREAT   — hp < critical (60). Exit when hp ≥ critical_exit (120)
-//   ③ RESUPPLY  — ammo empty or hp < low (150). Exit when full.
-//   ④ PATROL    — default: follow patrol route
+//   ② RESUPPLY  — hp < hp_low (150) OR ammo ≤ ammo_low (50).
+//                 Drive to supply pad, recover passively (heal + free +100/min
+//                 ammo). Exit only when hp == max AND ammo ≥ ammo_ok (100).
+//                 Never gives up: keeps navigating home even after a respawn.
+//   ③ PATROL    — default: follow patrol route
 //
 #include "sentry_decision_sample/fsm.hpp"
 
@@ -48,64 +50,32 @@ void DecisionFsm::tick(const Context & ctx, double now_s)
 
 State DecisionFsm::select_state(const Context & ctx, double now_s)
 {
+  (void)now_s;
+
   // ① IDLE — referee down or game stopped
   if (!ctx.referee_fresh() || !ctx.game_running()) {
     state_reason_ = "referee stale / game not running";
     return State::IDLE;
   }
 
-  // ② RETREAT — critical hp (with hysteresis)
-  if (state_ == State::RETREAT) {
-    if (ctx.hp() < profile_.thresholds.hp_critical_exit) {
-      state_reason_ = "hp still below retreat exit";
-      return State::RETREAT;
-    }
-  } else if (ctx.hp_critical()) {
-    state_reason_ = "hp critical";
-    return State::RETREAT;
-  }
-
-  // ③ RESUPPLY — stay if still needed
+  // ② RESUPPLY — stay until fully recovered (hysteresis).
+  //    Exit only when hp == max AND ammo ≥ ammo_ok. This also covers respawn:
+  //    a dead sentry reads hp 0 → stays in RESUPPLY → keeps heading home after
+  //    it revives, until fully healed and rearmed.
   if (state_ == State::RESUPPLY) {
-    if (ctx.ammo_empty()) {
-      state_reason_ = "ammo empty, must stay in RESUPPLY";
+    if (!ctx.resupply_done()) {
+      state_reason_ = "recovering (hp/ammo not yet full)";
       return State::RESUPPLY;
     }
-
-    if (supply_backup_exhausted_) {
-      if (ctx.hp() < profile_.thresholds.hp_critical_exit) {
-        state_reason_ = "supply exhausted, hp still unsafe";
-        return State::RESUPPLY;
-      }
-    } else {
-      if (ctx.hp() < ctx.max_hp()) {
-        state_reason_ = "still healing";
-        return State::RESUPPLY;
-      }
-    }
+  } else if (ctx.needs_resupply()) {
+    // ③ RESUPPLY — enter when hp low or ammo low.
+    state_reason_ = ctx.hp_low() ? "hp low" : "ammo low";
+    return State::RESUPPLY;
   }
 
-  // ④ RESUPPLY — enter if needed (cooldown check via helper)
-  if (state_ != State::RESUPPLY && ctx.needs_resupply()) {
-    // Ammo-empty bypasses cooldown — no ammo means can't do anything else
-    if (!ctx.ammo_empty() && supply_in_cooldown(now_s)) {
-      state_reason_ = "needs resupply but in cooldown";
-    } else {
-      state_reason_ = ctx.ammo_empty() ? "ammo empty" : "hp low";
-      return State::RESUPPLY;
-    }
-  }
-
-  // ⑤ Default — PATROL
+  // ④ Default — PATROL
   state_reason_ = "default";
   return State::PATROL;
-}
-
-bool DecisionFsm::supply_in_cooldown(double now_s) const
-{
-  return supply_backup_exhausted_ &&
-         (supply_fail_time_ > 0.0) &&
-         (now_s - supply_fail_time_ < profile_.thresholds.supply_retry_cooldown_s);
 }
 
 // ============================================================================
@@ -116,12 +86,12 @@ bool DecisionFsm::can_leave_current_state(State next) const
 {
   if (next == state_) return true;
 
-  // Safety states always preempt
+  // IDLE (game not running) always preempts, and is always leavable.
   if (state_ == State::IDLE) return true;
-  if (next == State::IDLE || next == State::RETREAT) return true;
+  if (next == State::IDLE) return true;
 
-  // RESUPPLY can preempt any non-RETREAT state
-  if (next == State::RESUPPLY && state_ != State::RETREAT) return true;
+  // RESUPPLY (low hp / low ammo) preempts PATROL immediately.
+  if (next == State::RESUPPLY) return true;
 
   // Otherwise require minimum ticks to dampen oscillation
   return ticks_in_state_ >= profile_.thresholds.min_ticks_in_state;
@@ -138,26 +108,16 @@ void DecisionFsm::on_enter(State s, double now_s)
   goal_arrived_ = false;
   waypoint_started_s_ = now_s;
   waypoint_arrived_s_ = 0.0;
-  state_entered_s_ = now_s;
   ticks_in_state_ = 0;
 
   switch (s) {
     case State::IDLE:
       if (cancel_nav_) cancel_nav_();
       break;
-    case State::RETREAT:
-      operation_started_s_ = now_s;
-      // Clear any stale supply cooldown — retreat destination IS the supply pad,
-      // so when RETREAT ends we must be able to transition cleanly into RESUPPLY.
-      supply_backup_exhausted_ = false;
-      supply_fail_time_ = 0.0;
-      break;
     case State::RESUPPLY:
       operation_started_s_ = now_s;
       rfid_window_ = 0;
       supply_backup_idx_ = 0;
-      supply_backup_exhausted_ = false;
-      supply_fail_time_ = 0.0;
       break;
     case State::PATROL:
       break;
@@ -184,7 +144,6 @@ void DecisionFsm::run_behaviour(const Context & ctx, double now_s)
     case State::IDLE:     behave_idle(ctx, now_s);     break;
     case State::PATROL:   behave_patrol(ctx, now_s);   break;
     case State::RESUPPLY: behave_resupply(ctx, now_s); break;
-    case State::RETREAT:  behave_retreat(ctx, now_s);  break;
   }
 }
 
@@ -203,16 +162,22 @@ void DecisionFsm::behave_idle(const Context &, double)
 
 void DecisionFsm::behave_patrol(const Context & ctx, double now_s)
 {
-  // Tactical route selection:
-  //   late_game → patrol_late (if defined)
-  //   outpost alive → patrol_aggressive (if defined)
-  //   otherwise → default patrol
+  // Tactical route selection driven by our outpost:
+  //   outpost alive     → patrol_aggressive (前压), if defined
+  //   outpost destroyed → patrol (我方半场防守)
   const Route * route = &profile_.patrol;
-
-  if (ctx.late_game() && !profile_.patrol_late.empty()) {
-    route = &profile_.patrol_late;
-  } else if (ctx.outpost_alive() && !profile_.patrol_aggressive.empty()) {
+  if (ctx.outpost_alive() && !profile_.patrol_aggressive.empty()) {
     route = &profile_.patrol_aggressive;
+  }
+
+  // Route switched since last tick → reset waypoint tracking so we don't
+  // judge arrival/timeout of the OLD goal against the NEW route's indices,
+  // and don't chase a stale goal. Republish from the new route's start.
+  if (route != active_route_) {
+    active_route_ = route;
+    path_idx_ = 0;
+    goal_sent_ = false;
+    goal_arrived_ = false;
   }
 
   if (route->empty()) {
@@ -235,81 +200,59 @@ void DecisionFsm::behave_patrol(const Context & ctx, double now_s)
 
 void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
 {
-  // RFID debounce: 5-tick sliding window, ≥3 hits → confirmed.
+  // RFID debounce: 5-tick sliding window, ≥3 hits → confirmed on pad.
   // Tolerates occasional signal dropout without resetting.
   rfid_window_ = static_cast<uint8_t>((rfid_window_ << 1) & 0x1F);
   if (ctx.on_supply_pad()) rfid_window_ |= 1;
   if (__builtin_popcount(rfid_window_) >= 3) {
-    supply_backup_exhausted_ = false;
-    supply_fail_time_ = 0.0;
-    return;  // stay put — healing passively on the pad
+    return;  // on the pad — stay put, healing + refilling ammo passively
   }
 
-  // --- total timeout: cap the entire RESUPPLY chain ---
-  if (now_s - state_entered_s_ > profile_.thresholds.resupply_total_timeout_s) {
-    supply_backup_exhausted_ = true;
-    supply_fail_time_ = now_s;
+  // --- navigation: keep heading to the supply pad, never give up ---
+  // The pad is the only safe destination. We rotate through backup points on
+  // stuck/timeout, then wrap back to the primary — so a respawned sentry (hp
+  // recovered from 0) always resumes navigating home instead of stalling.
+
+  // Nav stuck → advance to next candidate immediately.
+  if (ctx.nav_failed()) {
+    advance_supply_target(now_s);
     return;
   }
 
-  // --- navigation ---
-
-  // Nav stuck → immediate fallback to next backup point
-  if (ctx.nav_failed() && !profile_.backup_supply_points.empty() &&
-      supply_backup_idx_ < profile_.backup_supply_points.size()) {
-    goal_sent_ = false;
-    publish_single_goal(profile_.backup_supply_points[supply_backup_idx_++], now_s);
-    operation_started_s_ = now_s;
-    return;
-  }
-
-  // First goal → primary supply point
+  // First goal → primary supply point.
   if (!goal_sent_) {
-    publish_single_goal(profile_.supply, now_s);
+    publish_single_goal(current_supply_target(), now_s);
     return;
   }
 
-  // Single-point timeout → try next backup
+  // Single-point timeout → rotate to next candidate.
   if (now_s - operation_started_s_ > profile_.thresholds.resupply_timeout_s) {
-    if (!profile_.backup_supply_points.empty() &&
-        supply_backup_idx_ < profile_.backup_supply_points.size()) {
-      goal_sent_ = false;
-      publish_single_goal(profile_.backup_supply_points[supply_backup_idx_++], now_s);
-      operation_started_s_ = now_s;
-      return;
-    }
-    supply_backup_exhausted_ = true;
-    supply_fail_time_ = now_s;
+    advance_supply_target(now_s);
   }
 }
 
 // ============================================================================
-//  behave_retreat — keep heading to supply pad, Nav2 handles path planning.
-//  Supply pad is in home base (enemy-forbidden zone), always reachable.
+//  supply target rotation — primary pad + backups, cycling forever
 // ============================================================================
 
-void DecisionFsm::behave_retreat(const Context & ctx, double now_s)
+const Waypoint & DecisionFsm::current_supply_target() const
 {
-  // Total timeout safety net — stop trying after cap
-  if (now_s - state_entered_s_ > profile_.thresholds.retreat_total_timeout_s) {
-    return;
+  // index 0 = primary supply pad; 1.. = backup_supply_points
+  if (supply_backup_idx_ == 0 || profile_.backup_supply_points.empty()) {
+    return profile_.supply;
   }
+  const std::size_t i = (supply_backup_idx_ - 1) % profile_.backup_supply_points.size();
+  return profile_.backup_supply_points[i];
+}
 
-  if (!goal_sent_) {
-    publish_single_goal(profile_.supply, now_s);
-    return;
-  }
-
-  if (ctx.goal_reached()) return;
-
-  // Stuck or single-point timeout → retry immediately (Nav2 replans).
-  // Republish on the same tick to stay consistent with behave_resupply.
-  if (ctx.nav_failed() ||
-      now_s - operation_started_s_ > profile_.thresholds.retreat_timeout_s) {
-    goal_sent_ = false;
-    publish_single_goal(profile_.supply, now_s);
-    operation_started_s_ = now_s;
-  }
+void DecisionFsm::advance_supply_target(double now_s)
+{
+  // Cycle: primary → backup[0] → … → backup[n-1] → primary → …
+  const std::size_t total = profile_.backup_supply_points.size() + 1;  // +1 for primary
+  supply_backup_idx_ = (supply_backup_idx_ + 1) % total;
+  goal_sent_ = false;
+  publish_single_goal(current_supply_target(), now_s);
+  operation_started_s_ = now_s;
 }
 
 // ============================================================================

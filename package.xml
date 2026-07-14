@@ -2,7 +2,7 @@
 <package format="3">
   <name>sentry_decision_sample</name>
   <version>0.1.0</version>
-  <description>Simplified sentry decision: PATROL when healthy, RESUPPLY when low, RETREAT when critical.</description>
+  <description>Simplified sentry navigation decision: PATROL when healthy, RESUPPLY (drive home, never give up) when hp/ammo low.</description>
   <maintainer email="boombroke@example.com">Boombroke</maintainer>
   <license>Apache-2.0</license>
 
@@ -16,6 +16,9 @@
   <depend>nav_msgs</depend>
   <depend>rm_interfaces</depend>
   <depend>yaml-cpp</depend>
+
+  <!-- python helper scripts: mock_referee.py / preflight_check.py -->
+  <exec_depend>rclpy</exec_depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 
