@@ -107,7 +107,7 @@ sentry_decision_sample/
 ├── launch/
 │   └── sentry_decision_sample_launch.py
 └── test/
-    └── fsm_test.cpp       # 25 个单元测试
+    └── fsm_test.cpp       # 26 个单元测试
 ```
 
 ### 5.1 依赖层次（单向，上层不依赖下层）
@@ -268,7 +268,7 @@ ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
 | 项目 | 状态 |
 |------|------|
 | 代码行数 | ~950 行 |
-| 单元测试 | 25/25 通过 |
+| 单元测试 | 26/26 通过 |
 | 编译警告 | 0 |
 | 死代码 | 0 |
 | 已知逻辑缺陷 | 0 |

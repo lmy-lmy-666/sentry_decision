@@ -156,6 +156,8 @@ void DecisionFsm::on_enter(State s, double now_s)
       operation_started_s_ = now_s;
       rfid_window_ = 0;
       supply_backup_idx_ = 0;
+      supply_backup_exhausted_ = false;
+      supply_fail_time_ = 0.0;
       break;
     case State::PATROL:
       break;
@@ -300,10 +302,13 @@ void DecisionFsm::behave_retreat(const Context & ctx, double now_s)
 
   if (ctx.goal_reached()) return;
 
-  // Stuck or single-point timeout → retry (Nav2 replans)
+  // Stuck or single-point timeout → retry immediately (Nav2 replans).
+  // Republish on the same tick to stay consistent with behave_resupply.
   if (ctx.nav_failed() ||
       now_s - operation_started_s_ > profile_.thresholds.retreat_timeout_s) {
     goal_sent_ = false;
+    publish_single_goal(profile_.supply, now_s);
+    operation_started_s_ = now_s;
   }
 }
 

@@ -324,6 +324,37 @@ TEST(DecisionFsm, ResupplyDoesNotOscillate)
   EXPECT_EQ(h.fsm.state(), State::PATROL);
 }
 
+TEST(DecisionFsm, ResupplyStaysAfterCooldownRetry)
+{
+  // After cooldown expires, re-entering RESUPPLY must get a full fresh
+  // attempt — not bail to PATROL because of a stale exhausted flag.
+  Profile p = make_profile();
+  p.thresholds.supply_retry_cooldown_s = 15.0;
+  p.thresholds.resupply_timeout_s = 1.0;   // fast exhaustion
+  Harness h{std::move(p)};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(140, 50));
+
+  // exhaust supply over several ticks
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  h.fsm.tick(h.ctx, 2.0);   // behave_resupply sets exhausted=true this tick
+                             // but select_state ran first → still RESUPPLY
+  h.fsm.tick(h.ctx, 3.0);   // select_state now sees exhausted=true → PATROL
+  ASSERT_EQ(h.fsm.state(), State::PATROL);
+
+  // cooldown expired, hp still 140 (in the [120,150) gap)
+  h.fsm.tick(h.ctx, 20.0);  // 20-2=18 > 15s cooldown → re-enter RESUPPLY
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+
+  // THE KEY CHECK: next tick must stay RESUPPLY, not bail to PATROL
+  h.fsm.tick(h.ctx, 21.0);
+  EXPECT_EQ(h.fsm.state(), State::RESUPPLY)
+      << "supply_backup_exhausted_ must be cleared on re-entry; "
+         "otherwise the FSM sees a fresh enter but a stale exhausted flag "
+         "and kicks itself back to PATROL after a single tick";
+}
+
 // =============================================================================
 //  Retreat
 // =============================================================================
