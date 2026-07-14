@@ -2,6 +2,10 @@
 
 > Sentry26 导航系统核心决策层 | 基于 C++17 FSM | RM2026 赛季
 
+| 仓库 | 分支 | 本地路径 |
+|------|------|----------|
+| [lmy-lmy-666/sentry_decision](https://github.com/lmy-lmy-666/sentry_decision) | `jazzy` | `/home/lmy/Sentry26/src/sentry_decision` |
+
 ---
 
 ## 一、在 Sentry26 中的位置
