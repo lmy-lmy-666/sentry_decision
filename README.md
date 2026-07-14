@@ -1,6 +1,10 @@
 # sentry_decision_sample
 
-哨兵自主导航调度器。只管一个问题：**下一步往哪走。**
+> 哨兵自主导航调度器。只管一个问题：**下一步往哪走。**
+
+| 仓库 | 分支 | 本地路径 |
+|------|------|----------|
+| [lmy-lmy-666/sentry_decision](https://github.com/lmy-lmy-666/sentry_decision) | `omni_decision_sample` | `/home/lmy/omni_navigation/src/omni_decision_sample` |
 
 ## 四个状态
 
