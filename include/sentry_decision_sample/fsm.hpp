@@ -42,6 +42,7 @@ private:
 
   // --- behaviours --------------------------------------------------
   void behave_idle(const Context & ctx, double now_s);
+  void behave_opening_strike(const Context & ctx, double now_s);
   void behave_patrol(const Context & ctx, double now_s);
   void behave_resupply(const Context & ctx, double now_s);
 
@@ -73,6 +74,10 @@ private:
 
   // state timing
   int    ticks_in_state_{0};
+
+  // OPENING_STRIKE state (match-start outpost strike, done once per match)
+  bool   opening_done_{false};      ///< true once the opening strike has been consumed
+  double opening_entered_s_{0.0};   ///< when OPENING_STRIKE was entered (for dwell timing)
 
   // RESUPPLY state
   uint8_t     rfid_window_{0};        ///< RFID debounce: 5-tick sliding window, ≥3 hits → confirmed

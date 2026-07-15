@@ -3,12 +3,15 @@
 // Simplified FSM — 3 states, navigation-only.
 //
 // Priority chain (evaluated every tick, first match wins):
-//   ① IDLE      — referee offline or game not running
-//   ② RESUPPLY  — hp < hp_low (150) OR ammo ≤ ammo_low (50).
-//                 Drive to supply pad, recover passively (heal + free +100/min
-//                 ammo). Exit only when hp == max AND ammo ≥ ammo_ok (100).
-//                 Never gives up: keeps navigating home even after a respawn.
-//   ③ PATROL    — default: follow patrol route
+//   ① IDLE           — referee offline or game not running
+//   ② RESUPPLY       — hp < hp_low (150) OR ammo ≤ ammo_low (50).
+//                      Drive to supply pad, recover passively (heal + free
+//                      +100/min ammo). Exit only when hp == max AND ammo ≥
+//                      ammo_ok (100). Never gives up (covers respawn).
+//   ③ OPENING_STRIKE — match start, once: drive to a firing spot and dwell so
+//                      auto-aim can destroy the enemy outpost. Preempted by
+//                      RESUPPLY (low hp/ammo). Consumed after dwell or preempt.
+//   ④ PATROL         — default: follow patrol route
 //
 #include "sentry_decision_sample/fsm.hpp"
 
@@ -68,9 +71,24 @@ State DecisionFsm::select_state(const Context & ctx, double now_s)
       return State::RESUPPLY;
     }
   } else if (ctx.needs_resupply()) {
-    // ③ RESUPPLY — enter when hp low or ammo low.
+    // RESUPPLY — enter when hp low or ammo low. This also preempts an ongoing
+    // OPENING_STRIKE; the strike is a once-per-match action, so being preempted
+    // consumes it (opening_done_ is latched in on_exit / behave).
+    if (state_ == State::OPENING_STRIKE) opening_done_ = true;
     state_reason_ = ctx.hp_low() ? "hp low" : "ammo low";
     return State::RESUPPLY;
+  }
+
+  // ③ OPENING_STRIKE — match start, once. Requires a configured firing spot.
+  if (state_ == State::OPENING_STRIKE) {
+    // stay until behave_opening_strike marks it done (dwell elapsed)
+    if (!opening_done_) {
+      state_reason_ = "opening strike (killing enemy outpost)";
+      return State::OPENING_STRIKE;
+    }
+  } else if (!opening_done_ && profile_.has_opening_strike) {
+    state_reason_ = "opening strike start";
+    return State::OPENING_STRIKE;
   }
 
   // ④ Default — PATROL
@@ -114,6 +132,9 @@ void DecisionFsm::on_enter(State s, double now_s)
     case State::IDLE:
       if (cancel_nav_) cancel_nav_();
       break;
+    case State::OPENING_STRIKE:
+      opening_entered_s_ = now_s;
+      break;
     case State::RESUPPLY:
       operation_started_s_ = now_s;
       rfid_window_ = 0;
@@ -141,9 +162,10 @@ void DecisionFsm::run_behaviour(const Context & ctx, double now_s)
   }
 
   switch (state_) {
-    case State::IDLE:     behave_idle(ctx, now_s);     break;
-    case State::PATROL:   behave_patrol(ctx, now_s);   break;
-    case State::RESUPPLY: behave_resupply(ctx, now_s); break;
+    case State::IDLE:            behave_idle(ctx, now_s);           break;
+    case State::OPENING_STRIKE:  behave_opening_strike(ctx, now_s); break;
+    case State::PATROL:          behave_patrol(ctx, now_s);         break;
+    case State::RESUPPLY:        behave_resupply(ctx, now_s);       break;
   }
 }
 
@@ -154,6 +176,34 @@ void DecisionFsm::run_behaviour(const Context & ctx, double now_s)
 void DecisionFsm::behave_idle(const Context &, double)
 {
   // Navigation was cancelled in on_enter.  Nothing to do while idle.
+}
+
+// ============================================================================
+//  behave_opening_strike — drive to the firing spot, dwell to let auto-aim
+//  destroy the enemy outpost, then consume this once-per-match action.
+// ============================================================================
+
+void DecisionFsm::behave_opening_strike(const Context & ctx, double now_s)
+{
+  // Dwell elapsed → strike consumed; select_state will fall through to PATROL.
+  if (now_s - opening_entered_s_ >= profile_.thresholds.opening_strike_duration_s) {
+    opening_done_ = true;
+    return;
+  }
+
+  // Drive to the firing spot once; hold there while auto-aim fires.
+  if (!goal_sent_) {
+    publish_single_goal(profile_.opening_strike, now_s);
+    return;
+  }
+
+  // Nav stuck en route → retry (re-plan). We keep trying: the strike spot is in
+  // our own half and should be reachable; if truly blocked, the dwell timer
+  // still expires and we move on.
+  if (ctx.nav_failed()) {
+    goal_sent_ = false;
+    publish_single_goal(profile_.opening_strike, now_s);
+  }
 }
 
 // ============================================================================
@@ -200,12 +250,19 @@ void DecisionFsm::behave_patrol(const Context & ctx, double now_s)
 
 void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
 {
-  // RFID debounce: 5-tick sliding window, ≥3 hits → confirmed on pad.
-  // Tolerates occasional signal dropout without resetting.
+  // --- arrival at the supply pad: POSITION-based primary, RFID auxiliary ---
+  // Primary: Nav2/odom arrival (goal_reached) — self-computed, does not depend
+  //   on the serial driver's RFID field (which may be mis-mapped upstream).
+  // Auxiliary: RFID confirmation (5-tick sliding window, ≥3 hits) — used only
+  //   as a faster/extra confirmation if the referee RFID bit is wired correctly.
+  // Either one confirms → stay put and recover passively (no goal re-issue,
+  //   so no 30s target jitter once we're home).
   rfid_window_ = static_cast<uint8_t>((rfid_window_ << 1) & 0x1F);
   if (ctx.on_supply_pad()) rfid_window_ |= 1;
-  if (__builtin_popcount(rfid_window_) >= 3) {
-    return;  // on the pad — stay put, healing + refilling ammo passively
+  const bool rfid_confirmed = __builtin_popcount(rfid_window_) >= 3;
+
+  if (goal_arrived_ || rfid_confirmed) {
+    return;  // arrived — stay put, healing + refilling ammo passively
   }
 
   // --- navigation: keep heading to the supply pad, never give up ---

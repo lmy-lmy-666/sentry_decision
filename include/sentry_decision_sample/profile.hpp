@@ -22,6 +22,10 @@ struct Profile
   Route  patrol;             ///< default patrol loop
   Waypoint supply;           ///< supply pad — the sole recovery destination (heal + refill)
 
+  // --- opening strike (optional) ---------------------------------
+  Waypoint opening_strike;   ///< match-start firing spot to hit enemy outpost
+  bool     has_opening_strike{false};  ///< true if 'opening_strike' is configured
+
   // --- optional tactical variant (selected at runtime) ----------
   Route patrol_aggressive;   ///< used while our outpost is alive (前哨存活激进前压)
                              ///< when outpost is destroyed → fall back to `patrol` (我方半场防守)

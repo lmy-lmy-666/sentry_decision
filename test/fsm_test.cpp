@@ -327,6 +327,32 @@ TEST(DecisionFsm, ResupplySendsGoalToSupplyPad)
   EXPECT_DOUBLE_EQ(h.goals[0].y, -5.0);
 }
 
+TEST(DecisionFsm, ResupplyStaysPutOnPositionArrivalWithoutRfid)
+{
+  // Arrival must be confirmed by Nav2/position (goal_reached), NOT dependent
+  // on RFID — because the upstream serial driver may mis-map the RFID bit.
+  // Once arrived, the sentry stays put (no goal re-issue / no 30s jitter).
+  Profile p = make_profile();
+  p.thresholds.resupply_timeout_s = 5.0;
+  Harness h{std::move(p)};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(140, FULL_AMMO));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  const std::size_t goals_after_first = h.goals.size();
+
+  // Nav2 reports arrival at the supply pad (RFID never fires)
+  h.ctx.set_nav_status(NavStatus::ARRIVED);
+  h.fsm.tick(h.ctx, 1.0);
+
+  // Well past resupply_timeout_s: must NOT re-issue a goal (stays put healing)
+  h.fsm.tick(h.ctx, 10.0);
+  h.fsm.tick(h.ctx, 20.0);
+  EXPECT_EQ(h.goals.size(), goals_after_first)
+      << "after position arrival the sentry must stay put, not keep re-issuing "
+         "supply goals every timeout";
+}
+
 TEST(DecisionFsm, BackupSupplyRotatedAfterTimeout)
 {
   Profile p = make_profile();
@@ -465,6 +491,99 @@ TEST(DecisionFsm, MidPatrolHpDropGoesResupply)
   h.ctx.update(robot(140, FULL_AMMO));  // hp drops below hp_low
   h.fsm.tick(h.ctx, 1.0);
   EXPECT_EQ(h.fsm.state(), State::RESUPPLY);
+}
+
+// =============================================================================
+//  Opening strike (kill enemy outpost at match start, once)
+// =============================================================================
+
+namespace
+{
+Profile strike_profile()
+{
+  Profile p = make_profile();
+  p.opening_strike = {5.0, 0.0, 0.0};
+  p.has_opening_strike = true;
+  p.thresholds.opening_strike_duration_s = 90.0;
+  return p;
+}
+}  // namespace
+
+TEST(DecisionFsm, OpeningStrikeAtMatchStart)
+{
+  // With a firing spot configured, a healthy sentry goes to OPENING_STRIKE
+  // first (not PATROL) and drives to the strike coordinate.
+  Harness h{strike_profile()};
+  h.ctx.update(game(RUNNING, 420));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::OPENING_STRIKE);
+  ASSERT_FALSE(h.goals.empty());
+  EXPECT_DOUBLE_EQ(h.goals[0].x, 5.0);
+}
+
+TEST(DecisionFsm, OpeningStrikeEndsAfterDwellThenPatrols)
+{
+  Harness h{strike_profile()};
+  h.ctx.update(game(RUNNING, 420));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::OPENING_STRIKE);
+  // still striking before dwell elapses
+  h.fsm.tick(h.ctx, 89.0);
+  EXPECT_EQ(h.fsm.state(), State::OPENING_STRIKE);
+  // dwell elapsed → behave marks done, next tick selects PATROL
+  h.fsm.tick(h.ctx, 90.0);
+  h.fsm.tick(h.ctx, 91.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
+}
+
+TEST(DecisionFsm, OpeningStrikeOnlyOncePerMatch)
+{
+  // After the strike is consumed, dropping back to healthy must NOT re-trigger
+  // another opening strike — it is a once-per-match action.
+  Harness h{strike_profile()};
+  h.ctx.update(game(RUNNING, 420));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::OPENING_STRIKE);
+  h.fsm.tick(h.ctx, 91.0);   // dwell done
+  h.fsm.tick(h.ctx, 92.0);
+  ASSERT_EQ(h.fsm.state(), State::PATROL);
+  // many ticks later, still healthy → must stay PATROL, never strike again
+  h.fsm.tick(h.ctx, 200.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
+}
+
+TEST(DecisionFsm, ResupplyPreemptsOpeningStrikeAndConsumesIt)
+{
+  // If hp/ammo drops during the opening strike, RESUPPLY preempts it, and the
+  // strike is consumed — after recovering, the sentry patrols, not re-strikes.
+  Harness h{strike_profile()};
+  h.ctx.update(game(RUNNING, 420));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::OPENING_STRIKE);
+
+  // hp drops mid-strike → RESUPPLY preempts
+  h.ctx.update(robot(100, FULL_AMMO));
+  h.fsm.tick(h.ctx, 5.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+
+  // fully recover → should PATROL (strike already consumed), not strike again
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
+  h.fsm.tick(h.ctx, 6.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
+}
+
+TEST(DecisionFsm, NoOpeningStrikeWhenNotConfigured)
+{
+  // Default profile has no opening_strike → behaves as before (straight to PATROL).
+  Harness h{make_profile()};
+  h.ctx.update(game(RUNNING, 420));
+  h.ctx.update(robot(FULL_HP, FULL_AMMO));
+  h.fsm.tick(h.ctx, 0.0);
+  EXPECT_EQ(h.fsm.state(), State::PATROL);
 }
 
 int main(int argc, char ** argv)

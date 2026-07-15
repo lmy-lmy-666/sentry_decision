@@ -83,9 +83,11 @@ public:
   // ========================================================================
 
   uint16_t hp() const { return robot_status_ ? robot_status_->current_hp : 0; }
-  uint16_t max_hp() const { return robot_status_ ? robot_status_->maximum_hp : 400; }
+  // NOTE: serial 0x0201 does NOT report maximum_hp (always 0), so we use the
+  // configured max_hp (auto sentry = 400) instead of robot_status_->maximum_hp.
+  uint16_t max_hp() const { return thresholds_.max_hp; }
   bool hp_low() const { return robot_status_ && robot_status_->current_hp < thresholds_.hp_low; }
-  bool hp_full() const { return robot_status_ && robot_status_->current_hp >= robot_status_->maximum_hp; }
+  bool hp_full() const { return robot_status_ && robot_status_->current_hp >= thresholds_.max_hp; }
 
   uint16_t ammo() const { return robot_status_ ? robot_status_->projectile_allowance_17mm : 0; }
   bool ammo_low() const { return robot_status_ && robot_status_->projectile_allowance_17mm <= thresholds_.ammo_low; }

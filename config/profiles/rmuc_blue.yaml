@@ -3,6 +3,7 @@
 name: rmuc_blue
 
 thresholds:
+  max_hp: 400            # 满血目标 (全自动哨兵=400; 串口 0x0201 不上报 maximum_hp, 必须在此配置)
   hp_low: 150            # enter RESUPPLY below this hp
   ammo_low: 50           # enter RESUPPLY at/below this ammo
   ammo_ok: 100           # leave RESUPPLY at/above this ammo (one free +100/min cycle)
@@ -11,6 +12,7 @@ thresholds:
   stuck_timeout_s: 10.0      # per-waypoint patrol timeout → skip to next
   resupply_timeout_s: 30.0   # single supply-point timeout → rotate to next (never gives up)
   referee_stale_timeout_s: 3.0
+  opening_strike_duration_s: 90.0   # 开局在打点位停留时长(秒), 让自瞄摧毁敌方前哨站; 凭自瞄DPS实测调
 
 # =============================================================================
 # ⚠️  坐标标定清单 (TODO: 上场前必须用实车在比赛地图逐点标定)
@@ -19,13 +21,18 @@ thresholds:
 #   1. 启动定位栈，把哨兵手动推到目标位置
 #   2. ros2 topic echo <odom话题> --once  读取 pose.pose.position 的 x/y
 #   3. 填入下方对应字段
-# 坐标系 = map (与 goal_frame 参数一致)。共需标定 5 个位置：
+# 坐标系 = map (与 goal_frame 参数一致)。共需标定 6 个位置：
+#   [ ] opening_strike      开局打前哨站位 (自瞄能打到敌方前哨站)
 #   [ ] patrol[0]           默认巡逻点1
 #   [ ] patrol[1]           默认巡逻点2
 #   [ ] patrol[2]           默认巡逻点3
 #   [ ] patrol_aggressive   前压点
 #   [ ] supply              补给点 (★最关键，必须验证可达)
 # =============================================================================
+
+# ★ 开局打点位: 比赛一开始先来这里, 让自瞄打敌方前哨站, 停留 opening_strike_duration_s 后转正常行为(只做一次)
+#   删掉此项 → 关闭开局打前哨站功能, 直接进巡逻
+opening_strike: {x: -2.0, y: 0.0}        # TODO 实车标定 (自瞄能打到敌方前哨站的位置)
 
 # --- default patrol loop (used when our outpost is destroyed → 我方半场防守) ---
 patrol:

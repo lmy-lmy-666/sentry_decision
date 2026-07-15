@@ -28,17 +28,19 @@ using Route = std::vector<Waypoint>;
 /// exchange). No separate RETREAT — at supply-only granularity a "critical hp"
 /// state produces the same navigation action (drive to the pad).
 enum class State {
-  IDLE,       ///< referee offline or game not running
-  PATROL,     ///< default: follow patrol route
-  RESUPPLY,   ///< low hp or low ammo → go to supply pad, recover, then leave
+  IDLE,            ///< referee offline or game not running
+  OPENING_STRIKE,  ///< match start: drive to a firing spot, dwell to let auto-aim kill enemy outpost (once)
+  PATROL,          ///< default: follow patrol route
+  RESUPPLY,        ///< low hp or low ammo → go to supply pad, recover, then leave
 };
 
 inline const char * to_string(State s)
 {
   switch (s) {
-    case State::IDLE:     return "IDLE";
-    case State::PATROL:   return "PATROL";
-    case State::RESUPPLY: return "RESUPPLY";
+    case State::IDLE:            return "IDLE";
+    case State::OPENING_STRIKE:  return "OPENING_STRIKE";
+    case State::PATROL:          return "PATROL";
+    case State::RESUPPLY:        return "RESUPPLY";
   }
   return "UNKNOWN";
 }
@@ -55,7 +57,8 @@ struct Thresholds
 {
   // --- hp / ammo (hysteresis) ------------------------------------
   // Enter RESUPPLY when hp < hp_low OR ammo <= ammo_low.
-  // Leave RESUPPLY only when hp == max AND ammo >= ammo_ok.
+  // Leave RESUPPLY only when hp >= max_hp AND ammo >= ammo_ok.
+  uint16_t max_hp{400};            ///< full-hp target (auto sentry = 400; serial 0x0201 does NOT report maximum_hp, so configure it here)
   uint16_t hp_low{150};            ///< enter RESUPPLY below this hp
   uint16_t ammo_low{50};           ///< enter RESUPPLY at/below this ammo
   uint16_t ammo_ok{100};           ///< leave RESUPPLY at/above this ammo (one free +100 cycle)
@@ -69,6 +72,9 @@ struct Thresholds
   double resupply_timeout_s{30.0}; ///< single supply-point timeout → rotate to next point (never gives up)
 
   double referee_stale_timeout_s{3.0};    ///< referee data expiry
+
+  // --- opening strike (kill enemy outpost at match start, once) ---
+  double opening_strike_duration_s{90.0}; ///< dwell at firing spot to let auto-aim destroy enemy outpost (1.5 min)
 };
 
 }  // namespace sentry_decision_sample

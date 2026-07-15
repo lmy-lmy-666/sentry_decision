@@ -9,6 +9,8 @@ find_package(nav2_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rm_interfaces REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 # ---- library -------------------------------------------------
@@ -24,6 +26,7 @@ target_include_directories(sentry_decision_sample_lib PUBLIC
 target_compile_features(sentry_decision_sample_lib PUBLIC cxx_std_17)
 ament_target_dependencies(sentry_decision_sample_lib
   rclcpp rclcpp_action rclcpp_components nav2_msgs geometry_msgs nav_msgs rm_interfaces
+  tf2_ros tf2_geometry_msgs
 )
 target_link_libraries(sentry_decision_sample_lib yaml-cpp::yaml-cpp)
 rclcpp_components_register_node(sentry_decision_sample_lib

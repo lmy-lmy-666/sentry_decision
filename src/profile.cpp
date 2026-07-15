@@ -61,6 +61,7 @@ Profile load_profile(const std::string & yaml_path)
   // --- thresholds (YAML overrides defaults) -------------------------
   const Thresholds def;
   const YAML::Node th = root["thresholds"];
+  p.thresholds.max_hp           = get_or<uint16_t>(th, "max_hp", def.max_hp);
   p.thresholds.hp_low           = get_or<uint16_t>(th, "hp_low", def.hp_low);
   p.thresholds.ammo_low         = get_or<uint16_t>(th, "ammo_low", def.ammo_low);
   p.thresholds.ammo_ok          = get_or<uint16_t>(th, "ammo_ok", def.ammo_ok);
@@ -69,11 +70,17 @@ Profile load_profile(const std::string & yaml_path)
   p.thresholds.stuck_timeout_s     = get_or<double>(th, "stuck_timeout_s", def.stuck_timeout_s);
   p.thresholds.resupply_timeout_s  = get_or<double>(th, "resupply_timeout_s", def.resupply_timeout_s);
   p.thresholds.referee_stale_timeout_s = get_or<double>(th, "referee_stale_timeout_s", def.referee_stale_timeout_s);
+  p.thresholds.opening_strike_duration_s = get_or<double>(th, "opening_strike_duration_s", def.opening_strike_duration_s);
 
   // --- routes & waypoints -------------------------------------------
   p.patrol          = parse_route(root["patrol"]);
   p.patrol_aggressive = parse_route(root["patrol_aggressive"]);
   if (root["supply"]) p.supply = parse_waypoint(root["supply"]);
+
+  if (root["opening_strike"]) {
+    p.opening_strike = parse_waypoint(root["opening_strike"]);
+    p.has_opening_strike = true;
+  }
 
   if (root["backup_supply_points"])
     p.backup_supply_points = parse_route(root["backup_supply_points"]);

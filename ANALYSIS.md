@@ -25,7 +25,8 @@
 | 弹药低(≤50)→去补给区 | 被攻击→反击（电控+自瞄） |
 | 补满(hp满且弹药≥100)→出去巡逻 | 主动兑换弹药 / 确认复活（电控） |
 | 有血有弹→巡逻 | 切换进攻/防御姿态（电控） |
-| 前哨存活→前压路线 / 前哨亡→半场防守 | 判断该不该开火（自瞄） |
+| 我方前哨存活→前压路线 / 我方前哨亡→半场防守 | 判断该不该开火（自瞄） |
+| 开局→去打点位让自瞄打敌方前哨站（一次） | — |
 | 阵亡复活后持续导航回补给区 | 接收雷达/自瞄数据 |
 
 ---
@@ -35,10 +36,10 @@
 | 数据源 | 话题 | 用途 |
 |--------|------|------|
 | 裁判系统-比赛状态 | `referee/game_status` | 判断比赛是否运行、剩余时间 |
-| 裁判系统-机器人状态 | `referee/robot_status` | 当前血量、弹药、最大血量 |
-| 裁判系统-RFID | `referee/rfidStatus` | 是否在补给区（确认到达） |
+| 裁判系统-机器人状态 | `referee/robot_status` | 当前血量、弹药（血量上限串口不上报，用配置 `max_hp`） |
+| 裁判系统-RFID | `referee/rfidStatus` | 补给区到达的**辅助**确认（主判据是位置到达） |
 | 裁判系统-全体血量 | `referee/all_robot_hp` | 前哨站是否存活、己方基地血量 |
-| 里程计 | `odometry` | 己方位置（Nav2 fallback 到达检测用） |
+| 里程计 | `odometry` | 己方位置（经 tf2 转到 map 系，用于位置到达检测） |
 
 共 **5 个订阅**。
 
@@ -60,11 +61,11 @@
 ```
 优先级从高到低：
 
-① IDLE      ← 裁判数据失效（超过 3 秒）或比赛未运行
-② RESUPPLY  ← 已在补给中且未恢复满 → 保持
-              退出条件：hp 回满 400 且 ammo ≥ 100（两者都满足才出）
-③ RESUPPLY  ← hp < 150 或 ammo ≤ 50 → 进入
-④ PATROL    ← 以上都不满足时的默认状态
+① IDLE           ← 裁判数据失效（超过 3 秒）或比赛未运行
+② RESUPPLY       ← hp < 150 或 ammo ≤ 50 → 进入；退出需 hp 回满 400 且 ammo ≥ 100
+                   （会抢断 OPENING_STRIKE，抢断即消费掉开局打点）
+③ OPENING_STRIKE ← 比赛开局、配了打点位、且本局还没打过 → 去打点位停留打前哨站
+④ PATROL         ← 以上都不满足时的默认状态
 ```
 
 **迟滞设计**：进入用 `hp<150 / ammo≤50`，退出用 `hp满 / ammo≥100`，进出阈值分离防止边界抖动。弹药靠补给区每分钟被动 +100 恢复，一个免费周期即可从 50 补过 100。
@@ -83,8 +84,9 @@
 | 状态 | 导航目标 | 说明 |
 |------|---------|------|
 | IDLE | 无（取消所有导航） | 裁判断连或比赛未运行时原地等待 |
-| PATROL | `patrol` / `patrol_aggressive` 路线循环 | 前哨站存活走 `patrol_aggressive`（前压），被打掉走 `patrol`（我方半场防守）。路线切换时重置路点追踪 |
-| RESUPPLY | `supply`（+ 可选 `backup_supply_points` 轮换） | RFID 滑动窗口确认到达后停留恢复；未到达则持续导航，卡住/超时就轮换候选点再回主点，**永不放弃**。满血且弹药≥100 后离开 |
+| OPENING_STRIKE | `opening_strike` 打点位 | 开局去打点位停留 `opening_strike_duration_s`(默认90s) 让自瞄摧毁敌方前哨站；被 RESUPPLY 抢断或时长到即消费，**每局一次** |
+| PATROL | `patrol` / `patrol_aggressive` 路线循环 | **我方**前哨站存活走 `patrol_aggressive`（前压），被打掉走 `patrol`（我方半场防守）；只看我方前哨站，与敌方无关。路线切换时重置路点追踪 |
+| RESUPPLY | `supply`（+ 可选 `backup_supply_points` 轮换） | 位置到达为主/RFID 为辅，确认到达后停留恢复；未到达则持续导航，卡住/超时就轮换候选点再回主点，**永不放弃**。满血且弹药≥100 后离开 |
 
 ---
 
@@ -109,7 +111,7 @@ sentry_decision_sample/
 ├── launch/
 │   └── sentry_decision_sample_launch.py
 └── test/
-    └── fsm_test.cpp       # 26 个单元测试
+    └── fsm_test.cpp       # 32 个单元测试
 ```
 
 ### 5.1 依赖层次（单向，上层不依赖下层）
@@ -132,9 +134,9 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 |------|------|
 | `Waypoint {x, y, dwell_s}` | 导航目标点 |
 | `Route = vector<Waypoint>` | 路点序列 |
-| `State` (enum) | IDLE / PATROL / RESUPPLY |
+| `State` (enum) | IDLE / OPENING_STRIKE / PATROL / RESUPPLY |
 | `NavStatus` (enum) | IDLE / MOVING / ARRIVED / FAILED |
-| `Thresholds` | 8 个可配置阈值，全部有默认值 |
+| `Thresholds` | 10 个可配置阈值，全部有默认值 |
 
 ### 5.3 context.hpp — 世界模型
 
@@ -151,9 +153,10 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 ### 5.4 fsm.cpp — 核心 FSM
 
 - **tick()**：select_state → can_leave_current_state → on_exit/on_enter → run_behaviour
-- **select_state()**：3 级优先级链（IDLE / RESUPPLY / PATROL），每 tick 重评估
-- **behave_patrol()**：按前哨站状态二选一路线（存活前压 / 被打掉半场防守），路线切换时重置路点追踪，卡住跳点
-- **behave_resupply()**：RFID 滑动窗口防抖确认到达 → 未到达则持续导航；nav_failed 或单点超时轮换候选点（主点↔备用点循环），**永不放弃**，天然覆盖复活回归
+- **select_state()**：4 级优先级链（IDLE / RESUPPLY / OPENING_STRIKE / PATROL），每 tick 重评估
+- **behave_opening_strike()**：开局导航到打点位，停留 `opening_strike_duration_s` 让自瞄打前哨站；时长到或被 RESUPPLY 抢断即置 `opening_done_`，本局不再触发
+- **behave_patrol()**：按**我方**前哨站状态二选一路线（存活前压 / 被打掉半场防守），路线切换时重置路点追踪，卡住跳点
+- **behave_resupply()**：位置到达（`goal_arrived_`）为主、RFID 滑动窗口为辅，任一确认即原地待命回血；未到达则持续导航，nav_failed 或单点超时轮换候选点（主点↔备用点循环），**永不放弃**，天然覆盖复活回归
 
 ---
 
@@ -178,15 +181,29 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 
 - **裁判 stale 超时**：3s 无数据→IDLE，取消所有导航
 - **所有数据访问**：`std::optional` 保护，null 时返回安全默认值
-- **RFID 滑动窗口防抖**：最近 5 帧中 ≥3 帧在补给区才确认，容忍偶发信号丢失
 - **线程安全**：依赖 `SingleThreadedExecutor`，所有回调和 timer 在同一线程串行
 
 ### 6.4 导航容错
 
 - **Nav2 action 可用**：走 Action 协议（feedback/result 回调，goal_id 比对防 stale）
-- **Nav2 action 不可用**：自动降级到 PoseStamped topic + odom 距离到达检测
-- **导航失败**：`nav_failed()` → 跳下一个路点或重试
+- **Nav2 action 不可用**：自动降级到 PoseStamped topic + 位置距离到达检测
+- **坐标系一致性**：odometry 在 odom 系、目标在 map 系，节点用 tf2 把位置转到 map 系再算距离（TF 不可用时安全降级用原值 + throttle 警告），避免 map→odom 漂移污染 fallback 到达判定
+- **导航失败**：`nav_failed()` → 跳下一个路点或轮换补给候选点
 - **cancel_nav**：始终 `async_cancel_all_goals`，fallback 模式下正确清理标志位
+
+### 6.5 对上游坏数据的容错（决策不依赖可能出错的外部信号）
+
+决策的核心闭环（去补给→回血→满了出去）完全由己方血量/弹药数值 + 自算的位置到达驱动，不依赖任何一个可能被上游喂错的辅助信号：
+
+| 潜在坏输入 | 决策的应对 |
+|-----------|-----------|
+| 串口不上报血量上限（maximum_hp=0） | 用配置的 `max_hp`(400) 判满血，不读串口该字段 |
+| RFID 补给区位被上游错映射 | **位置到达为主**（Nav2/odom，自算），RFID 仅作辅助确认，任一为真即到达 |
+| 裁判数据断流（>3s） | 进 IDLE，不拿过期数据决策 |
+| odom 与目标坐标系不一致 | tf2 转到 map 系再算距离 |
+| 阵亡（hp=0） | 保持 RESUPPLY，复活后继续导航回补给区（永不放弃） |
+
+> **到达补给区判定**：主判据 = `goal_arrived_`（Nav2 feedback 到达 / fallback 位置距离）；辅判据 = RFID 5-tick 滑动窗口（≥3 命中）。两者任一确认即原地待命回血，到达后不再重发目标（无 30s 抖动）。这样即使上游 RFID 字段映射错误，决策仍能靠位置到达正常工作。
 
 ---
 
@@ -196,6 +213,7 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| `max_hp` | 400 | 满血目标（全自动哨兵=400；串口不上报 maximum_hp，故在此配置） |
 | `hp_low` | 150 | 血量低于此值 → 进 RESUPPLY |
 | `ammo_low` | 50 | 弹药 ≤ 此值 → 进 RESUPPLY |
 | `ammo_ok` | 100 | 弹药 ≥ 此值（且血满）→ 退出 RESUPPLY |
@@ -204,6 +222,7 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 | `stuck_timeout_s` | 10.0 | 路点卡住超时（秒） |
 | `resupply_timeout_s` | 30.0 | 单个补给点超时→轮换（秒） |
 | `referee_stale_timeout_s` | 3.0 | 裁判数据过期时间（秒） |
+| `opening_strike_duration_s` | 90.0 | 开局打点位停留时长（秒），让自瞄摧毁敌方前哨站 |
 
 ### ROS2 参数
 
@@ -223,15 +242,28 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 PATROL 状态每 tick 按**我方前哨站状态**二选一：
 
 ```
-① outpost_alive（前哨站存活）且 patrol_aggressive 非空 → patrol_aggressive（前压）
+① outpost_alive（我方前哨站存活）且 patrol_aggressive 非空 → patrol_aggressive（前压）
 ② 否则（前哨站被打掉，或未配激进路线）              → patrol（我方半场防守）
 ```
 
-依据：前哨站存活时己方基地无敌，可放心前压；前哨站被击毁后基地暴露，退回半场防守。
+依据：我方前哨站存活时己方基地无敌，可放心前压；我方前哨站被击毁后基地暴露，退回半场防守。判断依据仅为我方前哨站生死，与敌方前哨站是否被摧毁无关。
 
 路线切换时会重置路点追踪（`path_idx_`/`goal_sent_`/`goal_arrived_`），从新路线起点重新发目标，避免追错航点。换战术只需修改 YAML，无需重新编译。
 
 > **末局决策未实现**：规则上"双方前哨站均被摧毁 + 基地血量胶着"时靠全队总伤害定胜负，此时该攻该守取决于**敌我基地血量对比**。但当前 `GameRobotHP.msg` 只解析了己方字段（`enemy_base_hp`/`enemy_outpost_hp`/`damage_difference` 未接入），读不到敌方数据，故末局专用逻辑暂不实现，等上游串口驱动补全敌方字段后再做。
+
+## 8.5 开局打前哨站（OPENING_STRIKE）
+
+比赛开局，若 profile 配置了 `opening_strike` 打点位，哨兵**第一件事**是导航到该点并停留 `opening_strike_duration_s`（默认 90s），让自瞄摧毁敌方前哨站，然后转入正常巡逻/补给，**本局不再触发**。
+
+- **触发**：比赛进入 RUNNING、配了 `opening_strike`、且 `opening_done_` 为假
+- **结束**：停留时长到 → 置 `opening_done_`；或被 RESUPPLY 抢断（血/弹不足）→ 同样消费掉
+- **优先级**：低于 RESUPPLY（血弹不足优先回补给），高于 PATROL
+- **关闭功能**：profile 里删掉 `opening_strike` 项即可，哨兵直接进 PATROL
+
+> ⚠️ **前提（需与视觉组确认）**：前哨站中央装甲开局旋转（比赛 3 分钟后才停），自瞄能否有效命中旋转装甲，决定本功能实际效果。决策只负责把哨兵开到打点位并停住，命中与否由自瞄决定。
+>
+> **判断"摧毁"的方式**：当前靠**固定时长**（读不到敌方前哨站血量——`enemy_outpost_hp` 串口未解析）。若将来上游补齐该数据，可改为"血量=0 才结束"更精确。
 
 ---
 
@@ -265,7 +297,7 @@ ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
 | 项目 | 状态 |
 |------|------|
 | 状态机 | 3 态（IDLE / PATROL / RESUPPLY） |
-| 单元测试 | 26/26 通过 |
+| 单元测试 | 32/32 通过 |
 | 编译警告 | 0 |
 | 死代码 | 0 |
 | 已知逻辑缺陷 | 0 |

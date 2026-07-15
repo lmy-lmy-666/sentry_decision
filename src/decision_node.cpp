@@ -8,7 +8,9 @@
 #include <stdexcept>
 #include <string>
 
+#include "geometry_msgs/msg/point_stamped.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 namespace sentry_decision_sample
 {
@@ -41,6 +43,10 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
 
   // --- Nav2 action client ------------------------------------------
   nav_action_client_ = rclcpp_action::create_client<NavigateToPose>(this, nav_action_name_);
+
+  // --- TF (transform odometry from its odom frame into goal_frame) --
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
   // --- FSM ---------------------------------------------------------
   fsm_ = std::make_unique<DecisionFsm>(
@@ -139,6 +145,16 @@ void DecisionNode::publish_goal(const Waypoint & wp)
       nav_action_name_.c_str(), pub_goal_->get_topic_name());
     publish_goal_topic_fallback(wp);
     return;
+  }
+
+  // Preempt any in-flight goal cleanly. We cancel the old goal on the Nav2
+  // side, and — crucially — drop our handle to it NOW. Between async_send_goal
+  // and the new goal's response callback, current_goal_handle_ stays null, so
+  // the old goal's ABORTED/CANCELED result falls through the null-guard in
+  // result_callback instead of being mistaken for the new goal failing.
+  if (current_goal_handle_) {
+    (void)nav_action_client_->async_cancel_goal(current_goal_handle_);
+    current_goal_handle_.reset();
   }
 
   auto options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
@@ -260,8 +276,39 @@ void DecisionNode::result_callback(const GoalHandleNavigateToPose::WrappedResult
 
 void DecisionNode::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
-  current_x_ = msg->pose.pose.position.x;
-  current_y_ = msg->pose.pose.position.y;
+  // Odometry is in the odom frame; goals are in goal_frame_ (map). The fallback
+  // arrival check compares position against the goal, so transform the position
+  // into goal_frame_ first — otherwise the map→odom drift corrupts the distance.
+  geometry_msgs::msg::PointStamped p_in;
+  p_in.header = msg->header;                     // frame_id = odom (from odom_bridge)
+  p_in.point = msg->pose.pose.position;
+
+  const std::string & src_frame = msg->header.frame_id;
+
+  if (src_frame.empty() || src_frame == goal_frame_) {
+    // already in goal frame (or unknown) — use as-is
+    current_x_ = p_in.point.x;
+    current_y_ = p_in.point.y;
+  } else {
+    try {
+      geometry_msgs::msg::PointStamped p_out =
+        tf_buffer_->transform(p_in, goal_frame_, tf2::durationFromSec(0.1));
+      current_x_ = p_out.point.x;
+      current_y_ = p_out.point.y;
+    } catch (const tf2::TransformException & ex) {
+      // TF unavailable (e.g. localization not up yet). Fall back to raw odom
+      // position — the fallback arrival check may be off until TF is available,
+      // but the primary Nav2 feedback path (used when Nav2 is running) is
+      // unaffected, and we avoid crashing / stalling.
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "TF %s->%s unavailable (%s); using raw odom for fallback arrival check",
+        src_frame.c_str(), goal_frame_.c_str(), ex.what());
+      current_x_ = p_in.point.x;
+      current_y_ = p_in.point.y;
+    }
+  }
+
   ctx_.set_sentry_position(current_x_, current_y_);
 }
 

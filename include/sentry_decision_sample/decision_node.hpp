@@ -14,6 +14,8 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
 #include "rm_interfaces/msg/game_robot_hp.hpp"
 #include "rm_interfaces/msg/game_status.hpp"
 #include "rm_interfaces/msg/rfid_status.hpp"
@@ -81,6 +83,10 @@ private:
 
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_goal_;
   rclcpp::TimerBase::SharedPtr tick_timer_;
+
+  // --- TF (odom-frame odometry → map-frame for fallback arrival check) ---
+  std::shared_ptr<tf2_ros::Buffer>            tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // --- parameters --------------------------------------------------
   std::string goal_frame_{"map"};
