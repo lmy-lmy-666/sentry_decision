@@ -43,6 +43,8 @@ install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 # python helper scripts (mock referee + preflight check)
 install(PROGRAMS
   scripts/mock_referee.py
+  scripts/mock_referee_tui.py
+  scripts/mock_referee_gui.py
   scripts/preflight_check.py
   DESTINATION lib/${PROJECT_NAME}
 )
