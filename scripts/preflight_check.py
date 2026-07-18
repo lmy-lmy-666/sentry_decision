@@ -6,13 +6,13 @@
 action 是否可用。任何一项红灯，都意味着决策上场后会瞎跑或卡死。
 
 用法：
-  ros2 run sentry_decision_sample preflight_check.py
+  ros2 run omni_decision_sample preflight_check.py
 
   # 自定义 odom 话题名 (若定位栈发布的不是 /odometry)
-  ros2 run sentry_decision_sample preflight_check.py --ros-args -p odom_topic:=/Odometry
+  ros2 run omni_decision_sample preflight_check.py --ros-args -p odom_topic:=/Odometry
 
   # 自定义检查时长 (默认 5 秒)
-  ros2 run sentry_decision_sample preflight_check.py --ros-args -p duration:=8.0
+  ros2 run omni_decision_sample preflight_check.py --ros-args -p duration:=8.0
 """
 
 import sys

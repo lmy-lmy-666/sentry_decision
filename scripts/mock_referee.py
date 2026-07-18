@@ -3,7 +3,7 @@
 Mock referee publisher — 模拟裁判系统数据，方便实车测试"残血回家"等行为。
 
 用法：
-  ros2 run sentry_decision_sample mock_referee.py --ros-args \
+  ros2 run omni_decision_sample mock_referee.py --ros-args \
     -p hp:=400 \          # 初始血量
     -p ammo:=300 \        # 初始弹药 (>50 才是 PATROL, ≤50 会进 RESUPPLY)
     -p max_hp:=400 \      # 最大血量

@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>sentry_decision_sample</name>
+  <name>omni_decision_sample</name>
   <version>0.1.0</version>
   <description>Simplified sentry navigation decision: PATROL when healthy, RESUPPLY (drive home, never give up) when hp/ammo low.</description>
   <maintainer email="boombroke@example.com">Boombroke</maintainer>

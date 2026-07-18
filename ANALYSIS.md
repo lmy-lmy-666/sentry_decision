@@ -1,4 +1,4 @@
-# sentry_decision_sample — 哨兵导航调度器
+# omni_decision_sample — 哨兵导航调度器
 
 > 最后更新: 2026-07-14 | 目标机器人: 全自动哨兵 (Sentry) | 赛季: RM2026
 
@@ -6,7 +6,7 @@
 
 ## 1. 定位
 
-`sentry_decision_sample` 是一个**纯导航调度器**。它只回答一个问题：**哨兵下一步往哪走。**
+`omni_decision_sample` 是一个**纯导航调度器**。它只回答一个问题：**哨兵下一步往哪走。**
 
 它不参与战斗（自瞄独立运作），不控制姿态（电控负责），不感知敌人。它只从裁判系统读取血量、弹药和前哨站状态，然后决定去巡逻还是回补给区。目标机器人是**全自动哨兵**（满血 400），弹药兑换/复活确认/姿态切换等全部交给电控，本模块只回答"下一步往哪走"。
 
@@ -14,7 +14,7 @@
 
 ```
 原版 sentry_decision (1,900 行)   → 完整 FSM，包揽导航+战斗+姿态，保留作参考
-精简版 sentry_decision_sample     → 纯导航 FSM，只调度目的地，当前主线
+精简版 omni_decision_sample     → 纯导航 FSM，只调度目的地，当前主线
 ```
 
 ### 设计取舍
@@ -28,6 +28,7 @@
 | 我方前哨存活→前压路线 / 我方前哨亡→半场防守 | 判断该不该开火（自瞄） |
 | 开局→去打点位让自瞄打敌方前哨站（一次） | — |
 | 阵亡复活后持续导航回补给区 | 接收雷达/自瞄数据 |
+| 过起伏路段→舵轮纯直线开环冲过（绕过 Nav2） | — |
 
 ---
 
@@ -49,33 +50,39 @@
 |------|------|------|
 | Nav2 goal | `navigate_to_pose` action | 导航目标点（主通道） |
 | `/goal_pose` | PoseStamped topic | Nav2 不可用时的 fallback |
+| `cmd_vel_chassis` | Twist topic | **仅过起伏段**：绕过 Nav2 直发底盘开环速度（见 8.6） |
 
-仅 **1 个输出通道**（Nav2 action，降级到 topic）。
+常规导航走 Nav2 action（降级到 topic）；过起伏段临时直发底盘速度（cancel Nav2 后底盘话题自然静默，不打架）。
 
 ---
 
 ## 4. 顶层状态机
+
+> 📊 图形化流转（ASCII + Mermaid 双份）+ 实战时序见 [docs/状态流转图.md](./docs/状态流转图.md)。
 
 ### 4.1 优先级链（每 tick 重评估，命中第一个满足的即返回）
 
 ```
 优先级从高到低：
 
-① IDLE           ← 裁判数据失效（超过 3 秒）或比赛未运行
-② RESUPPLY       ← hp < 150 或 ammo ≤ 50 → 进入；退出需 hp 回满 400 且 ammo ≥ 100
+① IDLE           ← 裁判数据失效（超过 3 秒）或比赛未运行（也是唯一能打断穿越的状态）
+② BUMP_TRAVERSE  ← 与目标分处某起伏段两侧且靠近入口 → 开环冲过；穿越中(未DONE/FAILED)不可被②以下任何状态打断
+③ RESUPPLY       ← hp < 150 或 ammo ≤ 50 → 进入；退出需 hp 回满 400 且 ammo ≥ 100
                    （会抢断 OPENING_STRIKE，抢断即消费掉开局打点）
-③ OPENING_STRIKE ← 比赛开局、配了打点位、且本局还没打过 → 去打点位停留打前哨站
-④ PATROL         ← 以上都不满足时的默认状态
+④ OPENING_STRIKE ← 比赛开局、配了打点位、且本局还没打过 → 去打点位停留打前哨站
+⑤ PATROL         ← 以上都不满足时的默认状态
 ```
 
 **迟滞设计**：进入用 `hp<150 / ammo≤50`，退出用 `hp满 / ammo≥100`，进出阈值分离防止边界抖动。弹药靠补给区每分钟被动 +100 恢复，一个免费周期即可从 50 补过 100。
 
 **复活兜底**：哨兵阵亡时 `hp=0`，会留在 RESUPPLY；复活后（hp 从 0 恢复但仍 <150）继续保持 RESUPPLY 并持续导航回补给区，直到恢复满。这是"永不放弃"设计的直接结果。
 
+**穿越抢占屏蔽**：BUMP_TRAVERSE 进入 DASHING 后，除 IDLE（比赛结束/裁判断连→立即零速）外不接受任何抢占——受击、血弹不足都不打断。中途停车 = 卡在波浪谷里。这道屏蔽有**两层**（select_state 强制返回 BUMP + can_leave_current_state 拒绝离开），纵深防御。
+
 ### 4.2 状态切换防振荡 (can_leave_current_state)
 
-- IDLE 可以随时离开
-- 进入 IDLE 总是允许
+- IDLE 可以随时离开；进入 IDLE 总是允许（也用于穿越急停）
+- **BUMP_TRAVERSE 穿越中（未 DONE/FAILED）只有 IDLE 能打断**；DONE/FAILED 后才放行交还业务状态
 - RESUPPLY 可以立即抢断 PATROL（血/弹不足优先）
 - 其他状态间切换需要 `min_ticks_in_state`（默认 4 ticks = 400ms）
 
@@ -85,6 +92,7 @@
 |------|---------|------|
 | IDLE | 无（取消所有导航） | 裁判断连或比赛未运行时原地等待 |
 | OPENING_STRIKE | `opening_strike` 打点位 | 开局去打点位停留 `opening_strike_duration_s`(默认90s) 让自瞄摧毁敌方前哨站；被 RESUPPLY 抢断或时长到即消费，**每局一次** |
+| BUMP_TRAVERSE | `bump_segments` 起伏段 | 舵轮纯直线恒速开环冲过波浪地形，绕过 Nav2 直发 `cmd_vel_chassis`；位置感知触发，见第 8.6 节 |
 | PATROL | `patrol` / `patrol_aggressive` 路线循环 | **我方**前哨站存活走 `patrol_aggressive`（前压），被打掉走 `patrol`（我方半场防守）；只看我方前哨站，与敌方无关。路线切换时重置路点追踪 |
 | RESUPPLY | `supply`（+ 可选 `backup_supply_points` 轮换） | 位置到达为主/RFID 为辅，确认到达后停留恢复；未到达则持续导航，卡住/超时就轮换候选点再回主点，**永不放弃**。满血且弹药≥100 后离开 |
 
@@ -93,25 +101,28 @@
 ## 5. 代码架构
 
 ```
-sentry_decision_sample/
+omni_decision_sample/
 ├── CMakeLists.txt
 ├── package.xml
-├── include/sentry_decision_sample/
-│   ├── types.hpp          # 枚举、结构体、阈值
+├── include/omni_decision_sample/
+│   ├── types.hpp          # 枚举、结构体、阈值(含 BumpPhase/State/Thresholds)
 │   ├── context.hpp        # Context: 比赛状态聚合器
-│   ├── profile.hpp        # Profile: YAML 加载
+│   ├── profile.hpp        # Profile: YAML 加载(含 BumpSegment)
+│   ├── arrival_tracker.hpp # ArrivalTracker: 无ROS的到达判定(防feedback抖动)
 │   ├── fsm.hpp            # DecisionFsm: 状态机声明
 │   └── decision_node.hpp  # DecisionNode: ROS2 节点声明
 ├── src/
-│   ├── profile.cpp        # YAML 解析
-│   ├── fsm.cpp            # FSM 实现
-│   └── decision_node.cpp  # 节点: 订阅、action client、fallback
+│   ├── profile.cpp        # YAML 解析 + 起伏段校验
+│   ├── fsm.cpp            # FSM 实现(含 behave_bump_traverse)
+│   └── decision_node.cpp  # 节点: 订阅、action client、fallback、cmd_vel
 ├── config/profiles/
 │   ├── rmuc_red.yaml / rmuc_blue.yaml
 ├── launch/
-│   └── sentry_decision_sample_launch.py
+│   └── omni_decision_sample_launch.py
 └── test/
-    └── fsm_test.cpp       # 32 个单元测试
+    ├── fsm_test.cpp             # 状态机 32 个
+    ├── arrival_tracker_test.cpp # 到达判定 11 个
+    └── bump_test.cpp            # 过起伏路段 11 个
 ```
 
 ### 5.1 依赖层次（单向，上层不依赖下层）
@@ -134,9 +145,12 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 |------|------|
 | `Waypoint {x, y, dwell_s}` | 导航目标点 |
 | `Route = vector<Waypoint>` | 路点序列 |
-| `State` (enum) | IDLE / OPENING_STRIKE / PATROL / RESUPPLY |
+| `BumpSegment {entry, exit, yaw}` | 起伏段（entry/exit 同 y，沿 x 轴直线） |
+| `State` (enum) | IDLE / OPENING_STRIKE / BUMP_TRAVERSE / PATROL / RESUPPLY |
+| `BumpPhase` (enum) | GOTO_ENTRY / ALIGN / DASHING / DONE / FAILED |
+| `BumpDir` (enum) | FORWARD / BACKWARD |
 | `NavStatus` (enum) | IDLE / MOVING / ARRIVED / FAILED |
-| `Thresholds` | 10 个可配置阈值，全部有默认值 |
+| `Thresholds` | 18 个可配置阈值，全部有默认值 |
 
 ### 5.3 context.hpp — 世界模型
 
@@ -153,8 +167,9 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 ### 5.4 fsm.cpp — 核心 FSM
 
 - **tick()**：select_state → can_leave_current_state → on_exit/on_enter → run_behaviour
-- **select_state()**：4 级优先级链（IDLE / RESUPPLY / OPENING_STRIKE / PATROL），每 tick 重评估
+- **select_state()**：5 级优先级链（IDLE / BUMP_TRAVERSE / RESUPPLY / OPENING_STRIKE / PATROL），每 tick 重评估；先定业务状态+目标 x，再判断是否有起伏段挡在中间
 - **behave_opening_strike()**：开局导航到打点位，停留 `opening_strike_duration_s` 让自瞄打前哨站；时长到或被 RESUPPLY 抢断即置 `opening_done_`，本局不再触发
+- **behave_bump_traverse()**：5 阶段过起伏段（GOTO_ENTRY→ALIGN→DASHING→DONE/FAILED），舵轮恒速开环冲，见 8.6。用 `for(;;)` 包 switch 使阶段转换当 tick 生效
 - **behave_patrol()**：按**我方**前哨站状态二选一路线（存活前压 / 被打掉半场防守），路线切换时重置路点追踪，卡住跳点
 - **behave_resupply()**：位置到达（`goal_arrived_`）为主、RFID 滑动窗口为辅，任一确认即原地待命回血；未到达则持续导航，nav_failed 或单点超时轮换候选点（主点↔备用点循环），**永不放弃**，天然覆盖复活回归
 
@@ -174,6 +189,7 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 |------|--------|------|
 | `stuck_timeout_s` | 10s | 单个巡逻点超时→跳过下一个点 |
 | `resupply_timeout_s` | 30s | 单个补给点超时→轮换到下一候选点（循环，不放弃） |
+| `bump_timeout_s` | 20s | 冲起伏段超时→反向退回入口，标记该段本局禁用 |
 
 > 注：旧版的"总超时后原地放弃"逻辑已移除。RESUPPLY 只要未恢复满就持续导航，确保阵亡复活后一定能回补给区。
 
@@ -223,6 +239,20 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 | `resupply_timeout_s` | 30.0 | 单个补给点超时→轮换（秒） |
 | `referee_stale_timeout_s` | 3.0 | 裁判数据过期时间（秒） |
 | `opening_strike_duration_s` | 90.0 | 开局打点位停留时长（秒），让自瞄摧毁敌方前哨站 |
+| `bump_dash_speed` | 0.8 | 过起伏段冲刺恒速（m/s），见 8.6 |
+| `bump_reverse_speed` | 0.4 | 穿越失败反向退回速度（m/s） |
+| `bump_tol` | 0.25 | 起伏段出口 x 到达容差（m） |
+| `bump_entry_radius` | 0.5 | 距入口多近接管 + y 走廊门限（m） |
+| `bump_y_tol` | 0.10 | 起伏段入口/出口 y 偏差上限（m，启动校验） |
+| `bump_align_time_s` | 0.5 | cancel Nav2 后静默期（s，舵轮转正+链路排空） |
+| `bump_timeout_s` | 20.0 | 穿越超时 → 反向退回（s） |
+| `bump_stop_ticks` | 3 | 穿越到达后发几帧零速再交还 |
+
+### YAML 路点/段（非 thresholds）
+
+| 键 | 说明 |
+|----|------|
+| `bump_segments` | 起伏段列表，每项 `entry`/`exit`(同 y)/`yaw`；空=关闭过起伏功能，见 8.6 |
 
 ### ROS2 参数
 
@@ -233,6 +263,7 @@ decision_node.hpp → context.hpp + fsm.hpp + ROS2
 | `goal_topic` | `/goal_pose` | fallback goal 话题 |
 | `nav_action_name` | `navigate_to_pose` | Nav2 action 名称 |
 | `goal_frame` | `map` | goal 坐标帧 |
+| `bump_cmd_vel_topic` | `cmd_vel_chassis` | 过起伏段直发的底盘速度话题 |
 | `goal_reached_distance_tolerance` | 0.25 m | 到达判定距离 |
 
 ---
@@ -265,6 +296,59 @@ PATROL 状态每 tick 按**我方前哨站状态**二选一：
 >
 > **判断"摧毁"的方式**：当前靠**固定时长**（读不到敌方前哨站血量——`enemy_outpost_hp` 串口未解析）。若将来上游补齐该数据，可改为"血量=0 才结束"更精确。
 
+## 8.6 过起伏路段（BUMP_TRAVERSE）
+
+起伏路段是**波浪形颠簸地形**（连续凸起凹陷交替，非单坡）。Nav2 在上面会因点云抖动、定位颠簸、costmap 误判坡面为障碍而失效。所以这段**不走 Nav2**，改用两段式开环穿越。
+
+### 为什么能开环
+
+- 入口对准由 Nav2 完成（`entry` 点带 yaw），起伏段本身是直线 → 二维降一维，只控 `x` 方向速度。
+- 舵轮（swerve）底盘过坎**四轮必须同向前进** → 全程纯 `linear.x`，`y=0`、`yaw=0`、不自旋。这既是物理约束，也让开环成为唯一正确解。
+
+### 五个子阶段（BumpPhase）
+
+| 阶段 | 做什么 |
+|------|--------|
+| `GOTO_ENTRY` | 发 Nav2 goal 到入口点（对正冲刺 yaw），到达入口附近即进下一步 |
+| `ALIGN` | cancel Nav2，静默 `bump_align_time_s`（默认0.5s）：等舵轮转正 + 速度链路排空 |
+| `DASHING` | **恒速** `bump_dash_speed` 直冲，纯 `linear.x`；越过出口 x 即硬停 |
+| `DONE` | 发几帧零速停稳，交还进入前记录的业务状态（`bump_return_state_`） |
+| `FAILED` | 反向低速退回入口，退回成功则标记该段本局禁用 |
+
+### 关键设计（波浪地形特化）
+
+- **恒速不减速**：波浪地形靠冲量连续翻越，末端减速 = 卡在波谷。所以全程 `bump_dash_speed` 恒速，只在越过出口 x 后硬停（与单坡"末端线性减速"方案的本质区别）。
+- **到达判据只看 x**：单轴单边比较，`bump_tol` 放宽到 0.25（吸收颠簸定位抖动）；y/yaw 忽略。
+- **盲走兜底**：颠簸中 TF/定位短暂丢失是常态，`sentry_pos_valid()` 为假时保持上一帧速度继续冲，**绝不中途停车**（停 = 卡波谷）。
+- **抢占屏蔽**：DASHING 中除 IDLE 外不接受任何抢占（见 4.1/4.2）。
+
+### 触发（位置感知，自动）
+
+`find_bump_to_cross()` 每 tick 扫描 `bump_segments`：当哨兵与当前业务目标（巡逻/补给点）**分处某段 x 跨度的两侧**、且哨兵在该段 y 走廊内（`bump_entry_radius`），即接管。冲刺方向由"哨兵在哪侧"自动定：
+- **前压**：激进路线的点在高地侧 → 自然正向过（FORWARD）
+- **撤退**：残血时补给点在低地侧 → 自然反向过（BACKWARD，速度减半更稳）
+
+前压与过起伏段的绑定通过"激进路线的点配在起伏段对侧"体现，过起伏段能力本身只需纯位置感知。
+
+### 速度链路（为什么不打架）
+
+穿越起伏段直发 `cmd_vel_chassis`（底盘系终点），绕过 `fake_vel_transform`。实测该节点是纯回调驱动——只在收到 Nav2 速度时才转发一帧，自身 timer 只广播 TF、从不周期发零速。所以 cancel Nav2 后底盘话题自然静默，决策节点是穿越期间唯一速度源，无需 mux。
+
+### 参数（写入两份 profile 的 `thresholds` + `bump_segments`）
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `bump_dash_speed` | 0.8 | m/s 冲刺恒速（实测先低速再加） |
+| `bump_reverse_speed` | 0.4 | m/s 失败反向退回速度 |
+| `bump_tol` | 0.25 | m 出口 x 到达容差 |
+| `bump_entry_radius` | 0.5 | m 距入口多近接管，也是 y 走廊门限 |
+| `bump_y_tol` | 0.10 | m 入口/出口 y 偏差上限（启动校验，段必须沿 x 轴直线） |
+| `bump_align_time_s` | 0.5 | s cancel 后静默期（舵轮转正 + 链路排空） |
+| `bump_timeout_s` | 20.0 | s 穿越超时 → 反向退回 |
+| `bump_stop_ticks` | 3 | DONE 时发几帧零速再交还 |
+
+> ⚠️ `bump_segments` 坐标必须实车逐点标定（红蓝镜像分别标）。`bump_segments: []`（空）即关闭功能。启动时校验 `|entry.y-exit.y| ≤ bump_y_tol`，不满足直接抛异常。
+
 ---
 
 ## 9. 编译与运行
@@ -275,19 +359,23 @@ source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
 # 编译
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release --packages-select sentry_decision_sample
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release --packages-select omni_decision_sample
 
 # 单元测试
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON --packages-select sentry_decision_sample
-./build/sentry_decision_sample/fsm_test
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON --packages-select omni_decision_sample
+./build/omni_decision_sample/fsm_test              # 状态机 (32)
+./build/omni_decision_sample/arrival_tracker_test  # Nav2到达判定 (11)
+./build/omni_decision_sample/bump_test             # 过起伏路段 (11)
 
-# 红方
-ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
-  -p profile_path:=~/omni_navigation/src/omni_decision_sample/config/profiles/rmuc_red.yaml
+# 红方(默认)
+ros2 launch omni_decision_sample omni_decision_sample_launch.py profile:=rmuc_red.yaml
 
-# 蓝方
-ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
-  -p profile_path:=~/omni_navigation/src/omni_decision_sample/config/profiles/rmuc_blue.yaml
+# 蓝方(裸文件名自动解析到 config/profiles/)
+ros2 launch omni_decision_sample omni_decision_sample_launch.py profile:=rmuc_blue.yaml
+
+# 也支持完整/绝对路径
+ros2 launch omni_decision_sample omni_decision_sample_launch.py \
+  profile:=~/omni_navigation/src/omni_decision_sample/config/profiles/rmuc_red.yaml
 ```
 
 ---
@@ -296,12 +384,12 @@ ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
 
 | 项目 | 状态 |
 |------|------|
-| 状态机 | 3 态（IDLE / PATROL / RESUPPLY） |
-| 单元测试 | 32/32 通过 |
+| 状态机 | 5 态（IDLE / OPENING_STRIKE / BUMP_TRAVERSE / PATROL / RESUPPLY） |
+| 单元测试 | 54/54 通过（fsm 32 + arrival_tracker 11 + bump 11） |
 | 编译警告 | 0 |
 | 死代码 | 0 |
 | 已知逻辑缺陷 | 0 |
-| 待验证 | Profile 中的坐标需在实车场地标定确认 |
+| 待验证 | Profile 坐标需实车标定；起伏段 `bump_segments` 坐标+`bump_dash_speed` 需平地假坎→真实起伏段逐步验证 |
 | 未实现（有意） | 末局攻守决策（依赖敌方基地血量，当前链路读不到） |
 
 ---
@@ -310,7 +398,7 @@ ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                 sentry_decision_sample           │
+│                 omni_decision_sample           │
 │                                                 │
 │  裁判(血量/弹药) ──→ Context ──→ FSM ──→ Nav2    │
 │                                                 │
@@ -319,17 +407,58 @@ ros2 run sentry_decision_sample sentry_decision_sample_node --ros-args \
          │                              │
          │ 不需要                        │ 需要
          ▼                              ▼
-┌─────────────────┐          ┌─────────────────┐
+┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
 │  自瞄 (视觉组)   │          │  Nav2 导航      │
 │  独立运作        │          │  路径规划+执行   │
-│  看到人自动锁    │          │                 │
+│  看到人自动锁    │          │  → /cmd_vel_... │
+└─────────────────┘          └────────┬────────┘
+         │                            │ Twist
+         │ 不需要（电控组）            ▼
+         │                   ┌─────────────────┐
+         │                   │ rm_serial_driver│ 打包 lx/ly/az
+         │                   │ 订阅cmd_vel_chassis│ → control帧(0xA0)
+         │                   └────────┬────────┘
+         ▼                            ▼ USB CDC
+┌─────────────────┐          ┌─────────────────┐
+│  姿态/小陀螺     │          │  电控底盘        │
+│  电控自行管      │◀─────────│  舵轮运动        │
+│  (受击才转)      │  同一板    │  mode电控内部管  │
 └─────────────────┘          └─────────────────┘
-         │
-         │ 不需要（电控组）
-         ▼
-┌─────────────────┐
-│  姿态切换        │
-│  电控根据自瞄    │
-│  状态自行切换    │
-└─────────────────┘
 ```
+
+> 过起伏时决策也发 /cmd_vel_chassis(纯 linear.x), 经同一条串口链路到电控。详见 11.1。
+
+### 11.1 电控串口对接（已核实链路）
+
+决策发速度 → 串口驱动打包 → 电控底盘，全链路话题/字段已对齐:
+
+```
+omni_decision_sample                    rm_serial_driver              电控(sentry_chassis)
+  publish (Twist)                         订阅 /cmd_vel_chassis          USB CDC 收 control 帧(0xA0)
+  /cmd_vel_chassis  ──────────────────▶   lx=linear.x                ──▶ AUTO模式: vy=lx(前后)
+    linear.x = 前向速度                    ly=linear.y                     vx=ly(左右)
+    linear.y = 侧向(过起伏恒为0)           az=angular.z                    → 四舵轮
+    angular.z= 0(过起伏)                   mode=current_mode_(见下)
+```
+
+**职责边界（与电控约定，已确认）**:
+
+| 事项 | 归属 | 说明 |
+|------|------|------|
+| 底盘速度 lx/ly/az | **导航侧发** | 决策/Nav2 → /cmd_vel_chassis → 串口驱动 |
+| mode (小陀螺/estop) | **电控内部管** | 导航侧不发, 恒为 normal(0) |
+| 小陀螺旋转 | **电控** | 受击时电控自己触发(flag_groy), 不经串口 mode |
+| 急停 | **电控看门狗** | 决策停发 cmd_vel → 电控超时停车(非主动 estop) |
+| 姿态切换(MOVE/ATTACK/DEFENSE) | **电控** | 电控按哨兵血量+运动状态自行切 |
+
+**过起伏(BUMP_TRAVERSE)对接**: 决策直发 /cmd_vel_chassis(纯 linear.x), 与正常导航
+(fake_vel_transform 输出同话题)在时序上不冲突——过起伏前已 cancel Nav2, controller
+停止输出, fake_vel_transform 纯回调驱动随之静默, 决策成为唯一速度源。
+
+**⚠️ 依赖电控侧(非本模块)**:
+1. **电控"受击小陀螺"若实装**, 必须与移动/过起伏互斥——过起伏冲刺中触发旋转会导致舵轮翻车。
+2. **cmd_vel_chassis 双发布者**(fake_vel_transform + 决策)逻辑上不打架(过起伏已 cancel Nav2), 需实车/仿真验证。
+
+**信号未接真但暂时无害**:
+- `stage_remain_time` 电控写死 400: game_running() 主要靠 game_progress(真实), stage_remain_time 只做范围校验(400 合法), 当前不影响。若将来实现末局决策(依赖剩余时间), 需电控改回真值。
+- `ros_state` 串口驱动写死 2(running): 导航→电控状态心跳恒 running, 电控未用它做故障保护, 当前无影响。

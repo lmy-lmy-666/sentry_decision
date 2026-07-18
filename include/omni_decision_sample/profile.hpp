@@ -2,16 +2,27 @@
 //
 // YAML profile loader for simplified sentry decision.
 //
-#ifndef SENTRY_DECISION_SAMPLE__PROFILE_HPP_
-#define SENTRY_DECISION_SAMPLE__PROFILE_HPP_
+#ifndef OMNI_DECISION_SAMPLE__PROFILE_HPP_
+#define OMNI_DECISION_SAMPLE__PROFILE_HPP_
 
 #include <string>
 #include <vector>
 
-#include "sentry_decision_sample/types.hpp"
+#include "omni_decision_sample/types.hpp"
 
-namespace sentry_decision_sample
+namespace omni_decision_sample
 {
+
+/// An undulating (washboard) terrain segment the sentry must cross open-loop.
+/// The two poses are the flat ground just BEFORE and AFTER the bumps. The
+/// segment must be axis-aligned in X: |entry.y - exit.y| <= bump_y_tol.
+/// yaw is the chassis heading to face while dashing (radians, map frame).
+struct BumpSegment
+{
+  Waypoint entry;      ///< flat ground on one side (Nav2 drives here first, pre-aligned to yaw)
+  Waypoint exit;       ///< flat ground on the other side (dash target, judged on X)
+  double   yaw{0.0};   ///< heading to hold while crossing (align swerve wheels to travel dir)
+};
 
 struct Profile
 {
@@ -32,11 +43,14 @@ struct Profile
 
   // --- fallback chains -------------------------------------------
   std::vector<Waypoint> backup_supply_points;
+
+  // --- undulating terrain segments (crossed open-loop, bypassing Nav2) ------
+  std::vector<BumpSegment> bump_segments;
 };
 
 /// Parse a YAML profile. Throws std::runtime_error on invalid input.
 Profile load_profile(const std::string & yaml_path);
 
-}  // namespace sentry_decision_sample
+}  // namespace omni_decision_sample
 
-#endif  // SENTRY_DECISION_SAMPLE__PROFILE_HPP_
+#endif  // OMNI_DECISION_SAMPLE__PROFILE_HPP_

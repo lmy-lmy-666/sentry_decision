@@ -6,8 +6,8 @@
 // Thread safety: assumes SingleThreadedExecutor or equivalent guarantee
 // that all callbacks and the tick timer run on the same thread.
 //
-#ifndef SENTRY_DECISION_SAMPLE__CONTEXT_HPP_
-#define SENTRY_DECISION_SAMPLE__CONTEXT_HPP_
+#ifndef OMNI_DECISION_SAMPLE__CONTEXT_HPP_
+#define OMNI_DECISION_SAMPLE__CONTEXT_HPP_
 
 #include <optional>
 
@@ -15,9 +15,9 @@
 #include "rm_interfaces/msg/game_status.hpp"
 #include "rm_interfaces/msg/rfid_status.hpp"
 #include "rm_interfaces/msg/robot_status.hpp"
-#include "sentry_decision_sample/types.hpp"
+#include "omni_decision_sample/types.hpp"
 
-namespace sentry_decision_sample
+namespace omni_decision_sample
 {
 
 class Context
@@ -144,6 +144,9 @@ public:
   double sentry_x() const { return sentry_x_; }
   double sentry_y() const { return sentry_y_; }
   bool sentry_pos_valid() const { return sentry_pos_valid_; }
+  /// Simulate localization / TF loss (position becomes unusable). Coordinates
+  /// are retained; only the valid flag drops. Used by bump-traverse tests.
+  void invalidate_sentry_position() { sentry_pos_valid_ = false; }
 
   // ========================================================================
   //  gold (reserved for future remote-exchange decisions)
@@ -181,6 +184,6 @@ private:
   Thresholds thresholds_;
 };
 
-}  // namespace sentry_decision_sample
+}  // namespace omni_decision_sample
 
-#endif  // SENTRY_DECISION_SAMPLE__CONTEXT_HPP_
+#endif  // OMNI_DECISION_SAMPLE__CONTEXT_HPP_

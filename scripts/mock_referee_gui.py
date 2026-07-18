@@ -6,7 +6,7 @@
 数据（保持 referee 新鲜），比命令行更直观。
 
 用法：
-  ros2 run sentry_decision_sample mock_referee_gui.py
+  ros2 run omni_decision_sample mock_referee_gui.py
 
 需要图形环境 (DISPLAY)。若在无头机器上，改用 mock_referee_tui.py (键盘版)。
 """

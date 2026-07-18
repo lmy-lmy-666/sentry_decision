@@ -3,26 +3,32 @@
 // Simplified FSM — 3 states, no combat, no stance.
 // IDLE → RESUPPLY → PATROL (priority order).
 //
-#ifndef SENTRY_DECISION_SAMPLE__FSM_HPP_
-#define SENTRY_DECISION_SAMPLE__FSM_HPP_
+#ifndef OMNI_DECISION_SAMPLE__FSM_HPP_
+#define OMNI_DECISION_SAMPLE__FSM_HPP_
 
 #include <cstddef>
 #include <functional>
+#include <vector>
 
-#include "sentry_decision_sample/context.hpp"
-#include "sentry_decision_sample/profile.hpp"
-#include "sentry_decision_sample/types.hpp"
+#include "omni_decision_sample/context.hpp"
+#include "omni_decision_sample/profile.hpp"
+#include "omni_decision_sample/types.hpp"
 
-namespace sentry_decision_sample
+namespace omni_decision_sample
 {
 
 using GoalPublisher = std::function<void(const Waypoint &)>;
 using NavCanceller  = std::function<void()>;
+/// Publish an open-loop chassis velocity (linear.x only) while crossing a bump
+/// segment. vx is signed (m/s); y and yaw are always zero (swerve constraint).
+using BumpVelPublisher = std::function<void(double vx)>;
 
 class DecisionFsm
 {
 public:
-  DecisionFsm(Profile profile, GoalPublisher goal_pub, NavCanceller nav_cancel = nullptr);
+  DecisionFsm(
+    Profile profile, GoalPublisher goal_pub, NavCanceller nav_cancel = nullptr,
+    BumpVelPublisher bump_vel_pub = nullptr);
 
   /// Main entry point — call at tick_frequency (default 10 Hz).
   void tick(const Context & ctx, double now_s);
@@ -45,6 +51,17 @@ private:
   void behave_opening_strike(const Context & ctx, double now_s);
   void behave_patrol(const Context & ctx, double now_s);
   void behave_resupply(const Context & ctx, double now_s);
+  void behave_bump_traverse(const Context & ctx, double now_s);
+
+  // --- bump traverse helpers ---------------------------------------
+  /// Scan bump_segments; if the robot is near a segment's near-side entry AND
+  /// its current business goal lies across the segment, pick it and set the
+  /// dash direction. Returns the segment index, or -1 if none applies.
+  int  find_bump_to_cross(const Context & ctx, double goal_x) const;
+  const Waypoint & bump_dash_target() const;   ///< the exit we are dashing toward (dir-aware)
+  const Waypoint & bump_entry_target() const;  ///< the entry pose (Nav2 pre-align target)
+  double bump_dash_vx() const;                 ///< signed constant dash speed (dir-aware)
+  bool   bump_reached(const Context & ctx) const;  ///< X crossed the dash target (single-sided)
 
   // --- navigation helpers ------------------------------------------
   void drive_route(const Route & route, double now_s);
@@ -58,9 +75,10 @@ private:
   //  members
   // ==================================================================
 
-  Profile       profile_;
-  GoalPublisher publish_goal_;
-  NavCanceller  cancel_nav_;
+  Profile          profile_;
+  GoalPublisher    publish_goal_;
+  NavCanceller     cancel_nav_;
+  BumpVelPublisher publish_bump_vel_;
 
   State state_{State::IDLE};
 
@@ -84,10 +102,19 @@ private:
   std::size_t supply_backup_idx_{0};  ///< current backup supply point index (own variable, not path_idx_)
   double      operation_started_s_{0.0};  ///< current supply-point attempt start time
 
+  // BUMP_TRAVERSE state
+  BumpPhase bump_phase_{BumpPhase::GOTO_ENTRY};
+  int       bump_seg_idx_{-1};        ///< index into profile_.bump_segments being crossed
+  BumpDir   bump_dir_{BumpDir::FORWARD};
+  double    bump_phase_started_s_{0.0};  ///< entry time of ALIGN / DASHING (for align + timeout)
+  double    bump_last_vx_{0.0};       ///< last commanded vx (held during TF/position dropouts)
+  int       bump_stop_frames_{0};     ///< zero-vel frames emitted so far in DONE
+  std::vector<bool> bump_disabled_;   ///< per-segment: crossing failed this match → don't retry
+
   // logging
   const char * state_reason_{""};     ///< why was the current state selected
 };
 
-}  // namespace sentry_decision_sample
+}  // namespace omni_decision_sample
 
-#endif  // SENTRY_DECISION_SAMPLE__FSM_HPP_
+#endif  // OMNI_DECISION_SAMPLE__FSM_HPP_

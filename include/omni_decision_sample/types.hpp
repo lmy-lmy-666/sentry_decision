@@ -2,13 +2,13 @@
 //
 // Simplified sentry decision types — navigation-only, no combat.
 //
-#ifndef SENTRY_DECISION_SAMPLE__TYPES_HPP_
-#define SENTRY_DECISION_SAMPLE__TYPES_HPP_
+#ifndef OMNI_DECISION_SAMPLE__TYPES_HPP_
+#define OMNI_DECISION_SAMPLE__TYPES_HPP_
 
 #include <cstdint>
 #include <vector>
 
-namespace sentry_decision_sample
+namespace omni_decision_sample
 {
 
 /// A navigation waypoint in map frame. Orientation is omitted:
@@ -18,6 +18,14 @@ struct Waypoint
   double x{0.0};
   double y{0.0};
   double dwell_s{0.0};  ///< seconds to wait after arrival
+};
+
+/// Which end of a bump (undulating/washboard) segment we are heading TO.
+/// The chassis crosses the segment as a pure straight-line X translation; the
+/// direction is chosen at runtime from which side the robot is currently on.
+enum class BumpDir {
+  FORWARD,   ///< entry.x → exit.x  (vx sign = sign(exit.x - entry.x))
+  BACKWARD,  ///< exit.x → entry.x  (reverse; used on retreat)
 };
 
 using Route = std::vector<Waypoint>;
@@ -32,6 +40,7 @@ enum class State {
   OPENING_STRIKE,  ///< match start: drive to a firing spot, dwell to let auto-aim kill enemy outpost (once)
   PATROL,          ///< default: follow patrol route
   RESUPPLY,        ///< low hp or low ammo → go to supply pad, recover, then leave
+  BUMP_TRAVERSE,   ///< crossing an undulating (washboard) segment: open-loop straight dash, bypassing Nav2
 };
 
 inline const char * to_string(State s)
@@ -41,9 +50,24 @@ inline const char * to_string(State s)
     case State::OPENING_STRIKE:  return "OPENING_STRIKE";
     case State::PATROL:          return "PATROL";
     case State::RESUPPLY:        return "RESUPPLY";
+    case State::BUMP_TRAVERSE:   return "BUMP_TRAVERSE";
   }
   return "UNKNOWN";
 }
+
+/// Sub-phases within BUMP_TRAVERSE. The chassis is a swerve (舵轮) drive: to
+/// cross undulating terrain all four wheels must point along the travel
+/// direction, so the whole traversal is pure linear.x — no y, no yaw, no spin.
+/// Constant speed throughout (NO end-of-segment slowdown): on washboard terrain
+/// slowing down loses the momentum needed to climb the next crest, so we hold
+/// dash_speed until the exit-x is crossed, then hard-stop.
+enum class BumpPhase {
+  GOTO_ENTRY,  ///< Nav2-drive to the entry pose (yaw pre-aligned to dash dir), wait for arrival
+  ALIGN,       ///< cancel Nav2, wait align_time (swerve wheels rotate to travel dir + link goes silent)
+  DASHING,     ///< open-loop constant-speed straight dash across the segment
+  DONE,        ///< crossed: emit a few zero-vel frames, hand control back to the return state
+  FAILED,      ///< timed out / stuck: reverse-crawl back to entry, disable this segment for the match
+};
 
 enum class NavStatus {
   IDLE,
@@ -75,8 +99,20 @@ struct Thresholds
 
   // --- opening strike (kill enemy outpost at match start, once) ---
   double opening_strike_duration_s{90.0}; ///< dwell at firing spot to let auto-aim destroy enemy outpost (1.5 min)
+
+  // --- bump traverse (crossing undulating / washboard terrain, open-loop) ---
+  // Swerve chassis crosses as a pure straight X dash at CONSTANT speed (no
+  // slowdown — washboard needs momentum). Arrival is judged on X only.
+  double bump_dash_speed{0.8};     ///< m/s constant dash speed (start low, raise after real-terrain tests)
+  double bump_reverse_speed{0.4};  ///< m/s reverse-crawl speed on FAILED recovery
+  double bump_tol{0.25};           ///< m  X arrival tolerance (widened vs Nav2: bumpy localization jitter)
+  double bump_entry_radius{0.5};   ///< m  how close to entry (XY) before we take over and cross
+  double bump_y_tol{0.10};         ///< m  entry/exit y mismatch limit (segment must be axis-aligned in X)
+  double bump_align_time_s{0.5};   ///< s  after Nav2 cancel: let swerve wheels align + link go silent
+  double bump_timeout_s{20.0};     ///< s  dash timeout → FAILED (reverse recovery)
+  int    bump_stop_ticks{3};       ///< number of zero-vel frames to emit on DONE before handing back
 };
 
-}  // namespace sentry_decision_sample
+}  // namespace omni_decision_sample
 
-#endif  // SENTRY_DECISION_SAMPLE__TYPES_HPP_
+#endif  // OMNI_DECISION_SAMPLE__TYPES_HPP_

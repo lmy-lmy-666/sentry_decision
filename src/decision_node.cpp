@@ -2,7 +2,7 @@
 //
 // ROS 2 node — bridges referee/odom data → Context → FSM → Nav2 goals.
 //
-#include "sentry_decision_sample/decision_node.hpp"
+#include "omni_decision_sample/decision_node.hpp"
 
 #include <cmath>
 #include <stdexcept>
@@ -12,11 +12,11 @@
 #include "rclcpp_components/register_node_macro.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
-namespace sentry_decision_sample
+namespace omni_decision_sample
 {
 
 DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
-: rclcpp::Node("sentry_decision_sample", options)
+: rclcpp::Node("omni_decision_sample", options)
 {
   // --- parameters --------------------------------------------------
   const std::string profile_path = this->declare_parameter<std::string>("profile_path", "");
@@ -25,10 +25,13 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
   nav_action_name_ = this->declare_parameter<std::string>("nav_action_name", "navigate_to_pose");
   goal_reached_distance_tolerance_ =
     this->declare_parameter<double>("goal_reached_distance_tolerance", 0.25);
+  arrival_.set_tolerance(goal_reached_distance_tolerance_);
   goal_frame_ = this->declare_parameter<std::string>("goal_frame", "map");
+  bump_cmd_vel_topic_ =
+    this->declare_parameter<std::string>("bump_cmd_vel_topic", "cmd_vel_chassis");
 
   if (profile_path.empty()) {
-    throw std::runtime_error("sentry_decision_sample: 'profile_path' parameter is required");
+    throw std::runtime_error("omni_decision_sample: 'profile_path' parameter is required");
   }
 
   // --- profile -----------------------------------------------------
@@ -40,6 +43,9 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
 
   // --- publishers --------------------------------------------------
   pub_goal_ = create_publisher<geometry_msgs::msg::PoseStamped>(goal_topic, 10);
+  // Open-loop chassis velocity while crossing undulating terrain. Depth 1: only
+  // the latest command matters; we bypass Nav2 and drive the chassis directly.
+  pub_cmd_vel_ = create_publisher<geometry_msgs::msg::Twist>(bump_cmd_vel_topic_, 1);
 
   // --- Nav2 action client ------------------------------------------
   nav_action_client_ = rclcpp_action::create_client<NavigateToPose>(this, nav_action_name_);
@@ -52,7 +58,8 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
   fsm_ = std::make_unique<DecisionFsm>(
     std::move(profile),
     [this](const Waypoint & wp) { publish_goal(wp); },
-    [this]() { cancel_nav(); });
+    [this]() { cancel_nav(); },
+    [this](double vx) { publish_bump_vel(vx); });
 
   // --- subscriptions -----------------------------------------------
   sub_game_status_ = create_subscription<rm_interfaces::msg::GameStatus>(
@@ -77,7 +84,7 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
     std::chrono::duration_cast<std::chrono::nanoseconds>(period),
     [this]() { on_tick(); });
 
-  RCLCPP_INFO(get_logger(), "sentry_decision_sample started @ %.1f Hz", tick_hz);
+  RCLCPP_INFO(get_logger(), "omni_decision_sample started @ %.1f Hz", tick_hz);
 }
 
 // ============================================================================
@@ -90,10 +97,11 @@ void DecisionNode::on_tick()
   ctx_.set_now(now_s);
 
   // Fallback odom-based arrival detection (Nav2 unavailable)
-  if (fallback_goal_active_ && nav_goals_active_) {
+  if (fallback_goal_active_ && nav_goals_active_ && !arrival_.latched()) {
     const double dx = current_x_ - fallback_goal_x_;
     const double dy = current_y_ - fallback_goal_y_;
-    if (std::hypot(dx, dy) <= goal_reached_distance_tolerance_) {
+    arrival_.update_fallback_distance(std::hypot(dx, dy));
+    if (arrival_.arrived()) {
       ctx_.set_nav_status(NavStatus::ARRIVED);
       fallback_goal_active_ = false;
     }
@@ -129,6 +137,7 @@ void DecisionNode::on_tick()
 void DecisionNode::publish_goal(const Waypoint & wp)
 {
   fallback_goal_active_ = false;  // clear old fallback coordinates
+  arrival_.reset();               // new goal → fresh arrival latch
 
   NavigateToPose::Goal goal_msg;
   goal_msg.pose.header.stamp = this->now();
@@ -203,6 +212,7 @@ void DecisionNode::cancel_nav()
   if (!nav_action_client_->action_server_is_ready()) {
     nav_goals_active_ = false;
     fallback_goal_active_ = false;
+    arrival_.on_canceled();
     ctx_.set_nav_status(NavStatus::IDLE);
     return;
   }
@@ -210,8 +220,25 @@ void DecisionNode::cancel_nav()
   (void)nav_action_client_->async_cancel_all_goals();
   current_goal_handle_.reset();
   nav_goals_active_ = false;
+  arrival_.on_canceled();
   ctx_.set_nav_status(NavStatus::IDLE);
   RCLCPP_INFO(get_logger(), "cancelled all Nav2 goals");
+}
+
+// ============================================================================
+//  publish_bump_vel — open-loop chassis velocity (bump traverse only)
+// ============================================================================
+
+void DecisionNode::publish_bump_vel(double vx)
+{
+  // Swerve constraint: pure straight-line X translation. y and yaw are always
+  // zero so all four wheels point along the travel direction. Published to the
+  // chassis topic directly, bypassing Nav2 and fake_vel_transform (no spin).
+  geometry_msgs::msg::Twist cmd;
+  cmd.linear.x = vx;
+  cmd.linear.y = 0.0;
+  cmd.angular.z = 0.0;
+  pub_cmd_vel_->publish(cmd);
 }
 
 // ============================================================================
@@ -221,7 +248,8 @@ void DecisionNode::cancel_nav()
 void DecisionNode::goal_response_callback(const GoalHandleNavigateToPose::SharedPtr & goal_handle)
 {
   if (!goal_handle) {
-    ctx_.set_nav_status(NavStatus::FAILED);
+    arrival_.on_result_failed();
+    ctx_.set_nav_status(arrival_.status());
     nav_goals_active_ = false;
     current_goal_handle_.reset();
     RCLCPP_WARN(get_logger(), "Nav2 rejected the goal");
@@ -239,11 +267,10 @@ void DecisionNode::feedback_callback(
       goal_handle->get_goal_id() != current_goal_handle_->get_goal_id()) {
     return;  // stale goal
   }
-  if (feedback->distance_remaining <= goal_reached_distance_tolerance_) {
-    ctx_.set_nav_status(NavStatus::ARRIVED);
-    return;
-  }
-  ctx_.set_nav_status(NavStatus::MOVING);
+  // The tracker latches ARRIVED, so a later feedback with a larger
+  // distance_remaining can't demote it back to MOVING (see ArrivalTracker).
+  arrival_.update_feedback(feedback->distance_remaining);
+  ctx_.set_nav_status(arrival_.status());
 }
 
 void DecisionNode::result_callback(const GoalHandleNavigateToPose::WrappedResult & result)
@@ -256,15 +283,18 @@ void DecisionNode::result_callback(const GoalHandleNavigateToPose::WrappedResult
 
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
-      ctx_.set_nav_status(NavStatus::ARRIVED);
+      arrival_.on_result_succeeded();   // latch against any late feedback
+      ctx_.set_nav_status(arrival_.status());
       break;
     case rclcpp_action::ResultCode::CANCELED:
-      ctx_.set_nav_status(NavStatus::IDLE);
+      arrival_.on_canceled();
+      ctx_.set_nav_status(arrival_.status());
       nav_goals_active_ = false;
       break;
     case rclcpp_action::ResultCode::ABORTED:
     case rclcpp_action::ResultCode::UNKNOWN:
-      ctx_.set_nav_status(NavStatus::FAILED);
+      arrival_.on_result_failed();
+      ctx_.set_nav_status(arrival_.status());
       nav_goals_active_ = false;
       break;
   }
@@ -312,6 +342,6 @@ void DecisionNode::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr ms
   ctx_.set_sentry_position(current_x_, current_y_);
 }
 
-}  // namespace sentry_decision_sample
+}  // namespace omni_decision_sample
 
-RCLCPP_COMPONENTS_REGISTER_NODE(sentry_decision_sample::DecisionNode)
+RCLCPP_COMPONENTS_REGISTER_NODE(omni_decision_sample::DecisionNode)

@@ -2,7 +2,7 @@
 //
 // Unit tests for simplified DecisionFsm (3 states: IDLE / PATROL / RESUPPLY).
 //
-#include "sentry_decision_sample/fsm.hpp"
+#include "omni_decision_sample/fsm.hpp"
 
 #include <gtest/gtest.h>
 
@@ -12,16 +12,16 @@
 #include "rm_interfaces/msg/game_status.hpp"
 #include "rm_interfaces/msg/rfid_status.hpp"
 #include "rm_interfaces/msg/robot_status.hpp"
-#include "sentry_decision_sample/context.hpp"
-#include "sentry_decision_sample/profile.hpp"
-#include "sentry_decision_sample/types.hpp"
+#include "omni_decision_sample/context.hpp"
+#include "omni_decision_sample/profile.hpp"
+#include "omni_decision_sample/types.hpp"
 
-using sentry_decision_sample::Context;
-using sentry_decision_sample::DecisionFsm;
-using sentry_decision_sample::NavStatus;
-using sentry_decision_sample::Profile;
-using sentry_decision_sample::State;
-using sentry_decision_sample::Waypoint;
+using omni_decision_sample::Context;
+using omni_decision_sample::DecisionFsm;
+using omni_decision_sample::NavStatus;
+using omni_decision_sample::Profile;
+using omni_decision_sample::State;
+using omni_decision_sample::Waypoint;
 
 namespace
 {

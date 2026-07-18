@@ -6,7 +6,7 @@
 前哨站等场景，比手打 `ros2 topic pub` 顺手得多。
 
 用法：
-  ros2 run sentry_decision_sample mock_referee_tui.py
+  ros2 run omni_decision_sample mock_referee_tui.py
 
 按键：
   1  满血满弹   (hp=400 ammo=300)  → 决策应 PATROL
