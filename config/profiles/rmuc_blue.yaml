@@ -27,9 +27,10 @@ thresholds:
 # ⚠️  坐标标定清单 (TODO: 上场前必须用实车在比赛地图逐点标定)
 # =============================================================================
 # 下面所有 x/y 均为【占位符】，未经实车验证。标定方法：
-#   1. 启动定位栈，把哨兵手动推到目标位置
-#   2. ros2 topic echo <odom话题> --once  读取 pose.pose.position 的 x/y
-#   3. 填入下方对应字段
+#   1. 启动定位栈, 确认 map->odom 已建立(ros2 run tf2_ros tf2_echo map odom 数值稳定)
+#   2. 把哨兵推到目标位置, 读 map 系坐标(★不是 odom):
+#      ros2 run tf2_ros tf2_echo map gimbal_yaw   取 Translation 的 x/y
+#   3. 填入下方对应字段 (详见 docs/坐标标定说明.md)
 # 坐标系 = map (与 goal_frame 参数一致)。共需标定 6 个位置：
 #   [ ] opening_strike      开局打前哨站位 (自瞄能打到敌方前哨站)
 #   [ ] patrol[0]           默认巡逻点1
@@ -64,8 +65,8 @@ backup_supply_points: []
 # 机制/约束同 rmuc_red.yaml。舵轮纯直线恒速冲, entry.y 必须≈exit.y(否则启动报错)。
 #
 # ★★★ 标定方法(每个数值怎么来) ★★★
-#   entry/exit: 把车手推到起伏段两侧的【平地】上, 各读一次坐标:
-#       ros2 topic echo /odometry --field pose.pose.position --once   (话题名按实际改)
+#   entry/exit: 把车手推到起伏段两侧的【平地】上, 各读一次 map 系坐标(★不是 odom):
+#       ros2 run tf2_ros tf2_echo map gimbal_yaw   取 Translation 的 x/y
 #   yaw: 冲刺车头朝向(弧度)。entry.y≈exit.y 时只有两种取值:
 #       exit.x > entry.x (往+x冲) → yaw: 0.0
 #       exit.x < entry.x (往-x冲) → yaw: 3.14159

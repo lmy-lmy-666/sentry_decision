@@ -122,7 +122,7 @@ omni_decision_sample/
 └── test/
     ├── fsm_test.cpp             # 状态机 32 个
     ├── arrival_tracker_test.cpp # 到达判定 11 个
-    └── bump_test.cpp            # 过起伏路段 11 个
+    └── bump_test.cpp            # 过起伏路段 12 个
 ```
 
 ### 5.1 依赖层次（单向，上层不依赖下层）
@@ -312,7 +312,7 @@ PATROL 状态每 tick 按**我方前哨站状态**二选一：
 | `GOTO_ENTRY` | 发 Nav2 goal 到入口点（对正冲刺 yaw），到达入口附近即进下一步 |
 | `ALIGN` | cancel Nav2，静默 `bump_align_time_s`（默认0.5s）：等舵轮转正 + 速度链路排空 |
 | `DASHING` | **恒速** `bump_dash_speed` 直冲，纯 `linear.x`；越过出口 x 即硬停 |
-| `DONE` | 发几帧零速停稳，交还进入前记录的业务状态（`bump_return_state_`） |
+| `DONE` | 发够 `bump_stop_ticks` 帧零速停稳，再由 select_state 重算并交还业务状态 |
 | `FAILED` | 反向低速退回入口，退回成功则标记该段本局禁用 |
 
 ### 关键设计（波浪地形特化）
@@ -385,7 +385,7 @@ ros2 launch omni_decision_sample omni_decision_sample_launch.py \
 | 项目 | 状态 |
 |------|------|
 | 状态机 | 5 态（IDLE / OPENING_STRIKE / BUMP_TRAVERSE / PATROL / RESUPPLY） |
-| 单元测试 | 54/54 通过（fsm 32 + arrival_tracker 11 + bump 11） |
+| 单元测试 | 55/55 通过（fsm 32 + arrival_tracker 11 + bump 12） |
 | 编译警告 | 0 |
 | 死代码 | 0 |
 | 已知逻辑缺陷 | 0 |

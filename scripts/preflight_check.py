@@ -8,8 +8,9 @@ action 是否可用。任何一项红灯，都意味着决策上场后会瞎跑�
 用法：
   ros2 run omni_decision_sample preflight_check.py
 
-  # 自定义 odom 话题名 (若定位栈发布的不是 /odometry)
-  ros2 run omni_decision_sample preflight_check.py --ros-args -p odom_topic:=/Odometry
+  # odom 话题默认 odometry(由 odom_bridge 发布)。链路: point_lio(aft_mapped_to_init)
+  # → odom_bridge → odometry。一般不用改；只在你的定位栈用了别的名时才覆盖:
+  ros2 run omni_decision_sample preflight_check.py --ros-args -p odom_topic:=odometry
 
   # 自定义检查时长 (默认 5 秒)
   ros2 run omni_decision_sample preflight_check.py --ros-args -p duration:=8.0
