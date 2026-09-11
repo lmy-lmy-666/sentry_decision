@@ -10,7 +10,7 @@
 #include <string>
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
-#include "geometry_msgs/msg/twist.hpp"
+#include "geometry_msgs/msg/twist_stamped.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -93,7 +93,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr           sub_odom_;
 
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_goal_;
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_vel_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr pub_cmd_vel_;
   rclcpp::TimerBase::SharedPtr tick_timer_;
 
   // --- TF (odom-frame odometry → map-frame for fallback arrival check) ---
@@ -104,7 +104,7 @@ private:
   std::string goal_frame_{"map"};
   std::string nav_action_name_{"navigate_to_pose"};
   double      goal_reached_distance_tolerance_{0.25};
-  std::string bump_cmd_vel_topic_{"cmd_vel_chassis"};
+  std::string bump_cmd_vel_topic_{"cmd_vel_bump"};
 };
 
 }  // namespace omni_decision_sample

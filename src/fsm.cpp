@@ -346,25 +346,43 @@ void DecisionFsm::behave_patrol(const Context & ctx, double now_s)
 
 void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
 {
-  // --- arrival at the supply pad: POSITION-based primary, RFID auxiliary ---
-  // Primary: Nav2/odom arrival (goal_reached) — self-computed, does not depend
-  //   on the serial driver's RFID field (which may be mis-mapped upstream).
-  // Auxiliary: RFID confirmation (5-tick sliding window, ≥3 hits) — used only
-  //   as a faster/extra confirmation if the referee RFID bit is wired correctly.
-  // Either one confirms → stay put and recover passively (no goal re-issue,
-  //   so no 30s target jitter once we're home).
+  // --- "at the supply pad?" — REAL-TIME position, NOT a one-shot arrival latch.
+  // Why not goal_arrived_: that latch means "we reached SOME goal once" and is
+  // never cleared while we stay in RESUPPLY. If the sentry is then pushed out of
+  // the pad, or killed and respawned AWAY from it, goal_arrived_ stays true and
+  // the old code would `return` forever — healing in place off-pad, never
+  // re-navigating home. Judging on live distance fixes both cases: leave the
+  // pad → we're no longer "arrived" → we re-issue the goal and drive back.
+  //
+  // Two confirmations (either suffices):
+  //   • position: within supply_arrival_radius of the current supply target
+  //   • RFID: friendly-supply-zone bit, 5-tick sliding window ≥3 hits (only
+  //     meaningful if the referee RFID field is wired correctly upstream)
   rfid_window_ = static_cast<uint8_t>((rfid_window_ << 1) & 0x1F);
   if (ctx.on_supply_pad()) rfid_window_ |= 1;
   const bool rfid_confirmed = __builtin_popcount(rfid_window_) >= 3;
 
-  if (goal_arrived_ || rfid_confirmed) {
-    return;  // arrived — stay put, healing + refilling ammo passively
+  bool at_pad = rfid_confirmed;
+  if (!at_pad && ctx.sentry_pos_valid()) {
+    const Waypoint & tgt = current_supply_target();
+    const double dx = ctx.sentry_x() - tgt.x;
+    const double dy = ctx.sentry_y() - tgt.y;
+    at_pad = std::hypot(dx, dy) <= profile_.thresholds.supply_arrival_radius;
+  }
+
+  if (at_pad) {
+    // On the pad → stay put, heal + refill ammo passively. Drop goal_sent_ so
+    // that if we later leave the pad (pushed off / respawn), the block below
+    // immediately re-issues the navigation goal instead of waiting on a stale
+    // "already sent" flag.
+    goal_sent_ = false;
+    return;
   }
 
   // --- navigation: keep heading to the supply pad, never give up ---
   // The pad is the only safe destination. We rotate through backup points on
   // stuck/timeout, then wrap back to the primary — so a respawned sentry (hp
-  // recovered from 0) always resumes navigating home instead of stalling.
+  // recovered from 0, possibly off-pad) always resumes navigating home.
 
   // Nav stuck → advance to next candidate immediately.
   if (ctx.nav_failed()) {
@@ -372,9 +390,11 @@ void DecisionFsm::behave_resupply(const Context & ctx, double now_s)
     return;
   }
 
-  // First goal → primary supply point.
+  // Not on the pad and no goal in flight → (re)issue the primary supply goal.
+  // This is what re-triggers navigation after being pushed off / respawning.
   if (!goal_sent_) {
     publish_single_goal(current_supply_target(), now_s);
+    operation_started_s_ = now_s;
     return;
   }
 

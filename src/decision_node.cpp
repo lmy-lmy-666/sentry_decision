@@ -28,7 +28,7 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
   arrival_.set_tolerance(goal_reached_distance_tolerance_);
   goal_frame_ = this->declare_parameter<std::string>("goal_frame", "map");
   bump_cmd_vel_topic_ =
-    this->declare_parameter<std::string>("bump_cmd_vel_topic", "cmd_vel_chassis");
+    this->declare_parameter<std::string>("bump_cmd_vel_topic", "cmd_vel_bump");
 
   if (profile_path.empty()) {
     throw std::runtime_error("omni_decision_sample: 'profile_path' parameter is required");
@@ -38,14 +38,14 @@ DecisionNode::DecisionNode(const rclcpp::NodeOptions & options)
   Profile profile = load_profile(profile_path);
   ctx_.set_thresholds(profile.thresholds);
   RCLCPP_INFO(
-    get_logger(), "loaded profile '%s' (%zu patrol waypoints)",
-    profile.name.c_str(), profile.patrol.size());
+    get_logger(), "loaded profile '%s' (%zu patrol waypoints, %zu bump segments)",
+    profile.name.c_str(), profile.patrol.size(), profile.bump_segments.size());
 
   // --- publishers --------------------------------------------------
   pub_goal_ = create_publisher<geometry_msgs::msg::PoseStamped>(goal_topic, 10);
   // Open-loop chassis velocity while crossing undulating terrain. Depth 1: only
   // the latest command matters; we bypass Nav2 and drive the chassis directly.
-  pub_cmd_vel_ = create_publisher<geometry_msgs::msg::Twist>(bump_cmd_vel_topic_, 1);
+  pub_cmd_vel_ = create_publisher<geometry_msgs::msg::TwistStamped>(bump_cmd_vel_topic_, 1);
 
   // --- Nav2 action client ------------------------------------------
   nav_action_client_ = rclcpp_action::create_client<NavigateToPose>(this, nav_action_name_);
@@ -233,11 +233,14 @@ void DecisionNode::publish_bump_vel(double vx)
 {
   // Swerve constraint: pure straight-line X translation. y and yaw are always
   // zero so all four wheels point along the travel direction. Published to the
-  // chassis topic directly, bypassing Nav2 and fake_vel_transform (no spin).
-  geometry_msgs::msg::Twist cmd;
-  cmd.linear.x = vx;
-  cmd.linear.y = 0.0;
-  cmd.angular.z = 0.0;
+  // The command gateway arbitrates this source against Nav2 and is the only
+  // publisher allowed to write the final chassis command topic.
+  geometry_msgs::msg::TwistStamped cmd;
+  cmd.header.stamp = now();
+  cmd.header.frame_id = "base_footprint";
+  cmd.twist.linear.x = vx;
+  cmd.twist.linear.y = 0.0;
+  cmd.twist.angular.z = 0.0;
   pub_cmd_vel_->publish(cmd);
 }
 

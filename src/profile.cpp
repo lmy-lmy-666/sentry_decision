@@ -97,6 +97,7 @@ Profile load_profile(const std::string & yaml_path)
   p.thresholds.min_ticks_in_state = get_or<uint8_t>(th, "min_ticks_in_state", def.min_ticks_in_state);
   p.thresholds.stuck_timeout_s     = get_or<double>(th, "stuck_timeout_s", def.stuck_timeout_s);
   p.thresholds.resupply_timeout_s  = get_or<double>(th, "resupply_timeout_s", def.resupply_timeout_s);
+  p.thresholds.supply_arrival_radius = get_or<double>(th, "supply_arrival_radius", def.supply_arrival_radius);
   p.thresholds.referee_stale_timeout_s = get_or<double>(th, "referee_stale_timeout_s", def.referee_stale_timeout_s);
   p.thresholds.opening_strike_duration_s = get_or<double>(th, "opening_strike_duration_s", def.opening_strike_duration_s);
   p.thresholds.bump_dash_speed    = get_or<double>(th, "bump_dash_speed", def.bump_dash_speed);

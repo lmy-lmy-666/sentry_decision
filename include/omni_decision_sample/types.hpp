@@ -94,6 +94,9 @@ struct Thresholds
   double stuck_timeout_s{10.0};    ///< per-waypoint patrol timeout
 
   double resupply_timeout_s{30.0}; ///< single supply-point timeout → rotate to next point (never gives up)
+  double supply_arrival_radius{0.4}; ///< m  "at the supply pad" position radius. RESUPPLY uses REAL-TIME
+                                     ///< distance (not a one-shot arrival latch) so a sentry pushed out of
+                                     ///< the pad — or killed & respawned away from it — re-navigates home.
 
   double referee_stale_timeout_s{3.0};    ///< referee data expiry
 

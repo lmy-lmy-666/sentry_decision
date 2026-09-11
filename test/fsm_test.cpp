@@ -329,11 +329,14 @@ TEST(DecisionFsm, ResupplySendsGoalToSupplyPad)
 
 TEST(DecisionFsm, ResupplyStaysPutOnPositionArrivalWithoutRfid)
 {
-  // Arrival must be confirmed by Nav2/position (goal_reached), NOT dependent
-  // on RFID — because the upstream serial driver may mis-map the RFID bit.
-  // Once arrived, the sentry stays put (no goal re-issue / no 30s jitter).
+  // "At the supply pad" is judged by REAL-TIME position (within
+  // supply_arrival_radius of the pad), NOT by a one-shot Nav2 arrival latch and
+  // NOT by RFID (the upstream serial driver may mis-map the RFID bit).
+  // While physically on the pad, the sentry stays put (no goal re-issue / no
+  // 30s jitter) and heals.
   Profile p = make_profile();
   p.thresholds.resupply_timeout_s = 5.0;
+  const auto pad = p.supply;  // (-1.0, -5.0)
   Harness h{std::move(p)};
   h.ctx.update(game(RUNNING, 300));
   h.ctx.update(robot(140, FULL_AMMO));
@@ -341,16 +344,47 @@ TEST(DecisionFsm, ResupplyStaysPutOnPositionArrivalWithoutRfid)
   ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
   const std::size_t goals_after_first = h.goals.size();
 
-  // Nav2 reports arrival at the supply pad (RFID never fires)
-  h.ctx.set_nav_status(NavStatus::ARRIVED);
+  // Sentry is physically standing on the supply pad (RFID never fires).
+  h.ctx.set_sentry_position(pad.x, pad.y);
   h.fsm.tick(h.ctx, 1.0);
 
   // Well past resupply_timeout_s: must NOT re-issue a goal (stays put healing)
   h.fsm.tick(h.ctx, 10.0);
   h.fsm.tick(h.ctx, 20.0);
   EXPECT_EQ(h.goals.size(), goals_after_first)
-      << "after position arrival the sentry must stay put, not keep re-issuing "
-         "supply goals every timeout";
+      << "while physically on the pad the sentry must stay put, not keep "
+         "re-issuing supply goals every timeout";
+}
+
+TEST(DecisionFsm, ResupplyReNavigatesWhenPushedOffPad)
+{
+  // Regression: sentry reached the pad, then was pushed OFF it (or killed and
+  // respawned away from it). It must notice it is no longer on the pad and
+  // re-navigate home — NOT heal in place off-pad forever. The old code latched
+  // goal_arrived_ and returned unconditionally, stalling off-pad.
+  Profile p = make_profile();
+  p.thresholds.resupply_timeout_s = 100.0;  // large: prove re-issue is position-driven, not timeout
+  const auto pad = p.supply;                // (-1.0, -5.0)
+  Harness h{std::move(p)};
+  h.ctx.update(game(RUNNING, 300));
+  h.ctx.update(robot(140, FULL_AMMO));      // low hp → RESUPPLY
+
+  // Drive to and settle on the pad.
+  h.fsm.tick(h.ctx, 0.0);
+  ASSERT_EQ(h.fsm.state(), State::RESUPPLY);
+  h.ctx.set_sentry_position(pad.x, pad.y);
+  h.fsm.tick(h.ctx, 1.0);
+  const std::size_t goals_on_pad = h.goals.size();
+
+  // Pushed well off the pad (still low hp, still RESUPPLY).
+  h.ctx.set_sentry_position(pad.x + 3.0, pad.y + 3.0);
+  h.fsm.tick(h.ctx, 2.0);
+
+  EXPECT_GT(h.goals.size(), goals_on_pad)
+      << "after being pushed off the pad the sentry must re-issue a supply goal "
+         "and drive back, not heal in place off-pad";
+  EXPECT_DOUBLE_EQ(h.goals.back().x, pad.x);
+  EXPECT_DOUBLE_EQ(h.goals.back().y, pad.y);
 }
 
 TEST(DecisionFsm, BackupSupplyRotatedAfterTimeout)

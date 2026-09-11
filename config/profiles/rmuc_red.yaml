@@ -14,14 +14,14 @@ thresholds:
   stuck_timeout_s: 10.0      # per-waypoint patrol timeout → skip to next
   resupply_timeout_s: 30.0   # single supply-point timeout → rotate to next (never gives up)
   referee_stale_timeout_s: 3.0
-  opening_strike_duration_s: 90.0   # 开局在打点位停留时长(秒), 让自瞄摧毁敌方前哨站; 凭自瞄DPS实测调
+  opening_strike_duration_s: 60.0   # 开局在打点位停留时长(秒), 让自瞄摧毁敌方前哨站; 凭自瞄DPS实测调
   # --- 过起伏路段 (舵轮纯直线开环冲, 绕过 Nav2) ---
   bump_dash_speed: 0.8       # m/s 冲起伏段恒速(不减速, 靠冲量翻波浪); 实测先0.8再往上加
   bump_reverse_speed: 0.4    # m/s 失败反向退回速度
   bump_tol: 0.25             # m   出口 x 到达容差(比Nav2放宽, 吸收颠簸定位抖动)
   bump_entry_radius: 0.5     # m   距入口多近就 cancel Nav2 接管, 也是 y 走廊门限
   bump_y_tol: 0.10           # m   入口/出口 y 偏差上限(段必须沿 x 轴直线, 配置校验用)
-  bump_align_time_s: 0.5     # s   cancel Nav2 后静默期(等舵轮转正 + 速度链路排空)
+  bump_align_time_s: 5.0     # s   cancel Nav2 后静默期(等舵轮转正 + 速度链路排空); 加长以充分摆正
   bump_timeout_s: 20.0       # s   穿越超时 → 反向退回
   bump_stop_ticks: 3         # 到达后发几帧零速再交还业务状态
 
@@ -44,20 +44,23 @@ thresholds:
 
 # ★ 开局打点位: 比赛一开始先来这里, 让自瞄打敌方前哨站, 停留 opening_strike_duration_s 后转正常行为(只做一次)
 #   删掉此项 → 关闭开局打前哨站功能, 直接进巡逻
-opening_strike: {x: 7.348, y: 0.242}     # 实测 (前哨站攻击点, z=0.225 决策不用)
+opening_strike: {x: 6.59, y: -0.794}     # 测试坐标 (前哨站攻击点, x>4.13 在起伏段右侧, 需冲过起伏段)
 
 # --- default patrol loop (used when our outpost is destroyed → 我方半场防守) ---
 patrol:
-  - {x: 2.594, y: 0.536, dwell_s: 10.0}  # 实测 巡逻点1
-  - {x: 6.497, y: 1.932, dwell_s: 15.0}  # 实测 巡逻点2
-  - {x: 10.488, y: 3.390, dwell_s: 10.0} # 实测 巡逻点3
+  - {x: 3.13,  y: 1.74, dwell_s: 5.0} # 测试坐标 巡逻点1
+  - {x: 0.522,  y: -2.77,  dwell_s: 5.0} # 测试坐标 巡逻点2
+  - {x: 4.63,  y: -2.78,  dwell_s: 5.0} # 测试坐标 巡逻点3
+#  - {x: -1.66, y: -9.15,  dwell_s: 5.0} # 测试坐标 巡逻点4
 
 # --- aggressive patrol while our outpost is alive (前压) ---
-patrol_aggressive:
-  - {x: 8.0, y: 0.0, dwell_s: 10.0}      # TODO 实车标定 (前压点, 暂用占位)
+# 暂时清空: 电控未接真实前哨站数据, ally_outpost_hp 被写死为 1500(假的满血),
+# 会误导决策走前压。清空后 fsm 强制走下方 patrol(防守4点), 不受前哨站假值影响。
+# 待电控上报真实前哨站血量后, 再填回前压点位启用。
+patrol_aggressive: []
 
 # ★ 补给点 = 唯一恢复点 + 阵亡复活回归点，务必验证 Nav2 能规划到达
-supply: {x: 0.327, y: -0.216}            # 实测 (回血点, z=0.128 决策不用)
+supply: {x: -0.277, y: 2.4}              # 测试坐标 (回血点)
 
 # 赛场只有一个回血点 → 保持空。若将来有第二安全位可填 [{x:.., y:.., dwell_s:0}]
 backup_supply_points: []
@@ -81,10 +84,11 @@ backup_supply_points: []
 #   保持全部注释 = 关闭过起伏功能(bump_segments 为空)。
 # 参考(sentry_nav_ws RMUC2026, 仅换算参考, 需按本队建图重标): 己方 (0.7,-7.086)->(5.458,-7.086)
 bump_segments:
-  # --- 起伏段 1 (去掉下面 3 行的 '# ' 并填值即可启用) ---
-  # - entry: {x: 0.00, y: 0.00}    # TODO 起伏段一侧平地实测坐标
-  #   exit:  {x: 0.00, y: 0.00}    # TODO 另一侧平地实测坐标 (y 必须与 entry 相同!)
-  #   yaw: 0.0                     # TODO 冲刺朝向: exit.x>entry.x填0.0, exit.x<entry.x填3.14159
+  # --- 起伏段 1 (暂时关闭: 铁板位置与哨兵路径 y 未对齐, 待重新标定后再启用) ---
+  #   实测参考: entry(2.86,-0.49) → exit(4.132,-0.49), yaw:0.0 (往+x冲)
+  # - entry: {x: 2.86,  y: -0.49}   # 实测 2.860,-0.466 (起点侧平地)
+  #   exit:  {x: 4.132, y: -0.49}   # 实测 4.132,-0.516 (前哨侧平地); y 与 entry 对齐
+  #   yaw: 0.0                      # 冲刺朝向: exit.x(4.13)>entry.x(2.86) → 往 +x 冲 → 0.0
   #
   # --- 起伏段 2 (如有第二段, 同样去注释填值) ---
   # - entry: {x: 0.00, y: 0.00}
