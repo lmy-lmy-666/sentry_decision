@@ -1,4 +1,4 @@
-# sentry_decision — 哨兵导航决策模块
+# omni_decision — 哨兵导航决策模块
 
 > omni_navigation 工作空间核心决策层 | 基于 C++17 FSM | RM2026 赛季
 
